@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import xlsx from "xlsx";
 import { store, getSnapshot } from "./data.js";
 import { validateAutomationPolicy } from "./safety.js";
 
@@ -24,6 +25,7 @@ const contentTypes = {
 };
 
 const sessions = new Map();
+const aiRequestLog = new Map();
 const demoAdmin = {
   email: "admin@rs.local",
   password: "admin12345"
@@ -34,14 +36,36 @@ function sendJson(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
-function parseTelegramContacts(text = "") {
-  const rows = String(text)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const validPattern = /^(@[a-zA-Z0-9_]{5,32}|https?:\/\/t\.me\/[a-zA-Z0-9_]{5,32}|t\.me\/[a-zA-Z0-9_]{5,32})$/;
-  const valid = rows.filter((line) => validPattern.test(line));
-  return { total: rows.length, valid: valid.length, rejected: rows.length - valid.length, sample: valid.slice(0, 5) };
+function normalizeTelegramContacts(text = "") {
+  const source = String(text);
+  const matches = [
+    ...source.matchAll(/(?:^|[\s,;])@([a-zA-Z0-9_]{5,32})\b/g),
+    ...source.matchAll(/(?:https?:\/\/)?t\.me\/([a-zA-Z0-9_]{5,32})\b/g)
+  ];
+  return [...new Set(matches.map((match) => `@${match[1]}`))];
+}
+
+function extractTextFromWorkbook(base64 = "") {
+  const buffer = Buffer.from(base64, "base64");
+  const workbook = xlsx.read(buffer, { type: "buffer" });
+  return workbook.SheetNames.map((sheetName) => {
+    const rows = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: "" });
+    return rows.flat().join("\n");
+  }).join("\n");
+}
+
+function parseTelegramContacts({ contacts = "", fileBase64 = "", filename = "" } = {}) {
+  const isWorkbook = /\.(xlsx|xls)$/i.test(filename);
+  const text = isWorkbook && fileBase64 ? extractTextFromWorkbook(fileBase64) : contacts;
+  const rawRows = String(text).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const validContacts = normalizeTelegramContacts(text);
+  return {
+    total: Math.max(rawRows.length, validContacts.length),
+    valid: validContacts.length,
+    rejected: Math.max(rawRows.length - validContacts.length, 0),
+    sample: validContacts.slice(0, 5),
+    contacts: validContacts
+  };
 }
 
 function resolveTimerProfile(timerProfile = "wait_60s") {
@@ -85,6 +109,20 @@ function getSessionUser(request) {
   const token = parseCookies(request.headers.cookie || "").rs_session;
   if (!token) return null;
   return sessions.get(token) || null;
+}
+
+function checkAiRateLimit(user) {
+  if (user?.role === "admin") return { ok: true };
+  const key = user?.id || user?.email || "anonymous";
+  const now = Date.now();
+  const previous = aiRequestLog.get(key) || 0;
+  const intervalMs = 15 * 60 * 1000;
+  if (now - previous < intervalMs) {
+    const waitMinutes = Math.ceil((intervalMs - (now - previous)) / 60000);
+    return { ok: false, error: `AI помощник доступен раз в 15 минут. Повторите запрос через ${waitMinutes} мин.` };
+  }
+  aiRequestLog.set(key, now);
+  return { ok: true };
 }
 
 async function loadUsers() {
@@ -188,9 +226,9 @@ async function handleApi(request, response) {
     users.push(user);
     await saveUsers(users);
     const token = randomBytes(32).toString("hex");
-    sessions.set(token, { id: user.id, email: user.email });
+    sessions.set(token, { id: user.id, email: user.email, role: user.role || "user" });
     response.setHeader("Set-Cookie", `rs_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`);
-    sendJson(response, 201, { ok: true, user: { id: user.id, email: user.email } });
+    sendJson(response, 201, { ok: true, user: { id: user.id, email: user.email, role: user.role || "user" } });
     return;
   }
 
@@ -205,9 +243,9 @@ async function handleApi(request, response) {
     }
 
     const token = randomBytes(32).toString("hex");
-    sessions.set(token, { id: user.id, email: user.email });
+    sessions.set(token, { id: user.id, email: user.email, role: user.role || "user" });
     response.setHeader("Set-Cookie", `rs_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`);
-    sendJson(response, 200, { ok: true, user: { id: user.id, email: user.email } });
+    sendJson(response, 200, { ok: true, user: { id: user.id, email: user.email, role: user.role || "user" } });
     return;
   }
 
@@ -299,7 +337,7 @@ async function handleApi(request, response) {
     const timer = resolveTimerProfile(body.timerProfile);
     const policy = validateAutomationPolicy({
       replyDelaySeconds: body.replyDelaySeconds || timer.replyDelaySeconds,
-      typingSeconds: body.typingSeconds || 5,
+      typingSeconds: 5,
       workingHoursPerDay: body.workingHoursPerDay || 6,
       outreachMode: "opt_in"
     });
@@ -322,7 +360,7 @@ async function handleApi(request, response) {
       promptText: body.promptText || "",
       replyDelaySeconds: Number(body.replyDelaySeconds || timer.replyDelaySeconds),
       repeatIntervalMinutes: timer.repeatIntervalMinutes,
-      typingSeconds: Number(body.typingSeconds || 5),
+      typingSeconds: 5,
       workingHoursPerDay: Number(body.workingHoursPerDay || 6),
       messagesSent: 0
     };
@@ -359,7 +397,11 @@ async function handleApi(request, response) {
 
   if (request.method === "POST" && url.pathname === "/api/imports") {
     const body = await readBody(request);
-    const contacts = parseTelegramContacts(body.contacts || body.csv || "");
+    const contacts = parseTelegramContacts({
+      contacts: body.contacts || body.csv || "",
+      fileBase64: body.fileBase64 || "",
+      filename: body.filename || "telegram-contacts.txt"
+    });
     const item = {
       id: `db-${Date.now()}`,
       filename: body.filename || "telegram-contacts.txt",
@@ -367,9 +409,14 @@ async function handleApi(request, response) {
       valid: contacts.valid,
       rejected: contacts.rejected,
       sample: contacts.sample,
+      contacts: contacts.contacts,
       createdAt: new Date().toISOString()
     };
     store.databases.push(item);
+    if (body.accountId) {
+      const account = store.accounts.find((entry) => entry.id === body.accountId);
+      if (account) account.databaseId = item.id;
+    }
     sendJson(response, 201, { ok: true, import: item });
     return;
   }
@@ -400,7 +447,7 @@ async function handleApi(request, response) {
     const timer = resolveTimerProfile(body.timerProfile || account.timerProfile);
     const policy = validateAutomationPolicy({
       replyDelaySeconds: timer.replyDelaySeconds,
-      typingSeconds: body.typingSeconds || account.typingSeconds || 5,
+      typingSeconds: 5,
       workingHoursPerDay: body.workingHoursPerDay || account.workingHoursPerDay || 6,
       outreachMode: "opt_in"
     });
@@ -414,7 +461,7 @@ async function handleApi(request, response) {
     account.promptText = body.promptText || "";
     account.replyDelaySeconds = timer.replyDelaySeconds;
     account.repeatIntervalMinutes = timer.repeatIntervalMinutes;
-    account.typingSeconds = Number(body.typingSeconds || account.typingSeconds || 5);
+    account.typingSeconds = 5;
     account.workingHoursPerDay = Number(body.workingHoursPerDay || account.workingHoursPerDay || 6);
     sendJson(response, 200, { ok: true, account });
     return;
@@ -434,6 +481,12 @@ async function handleApi(request, response) {
   }
 
   if (request.method === "POST" && url.pathname === "/api/ai-summary") {
+    const user = getSessionUser(request);
+    const limit = checkAiRateLimit(user);
+    if (!limit.ok) {
+      sendJson(response, 429, { ok: false, error: limit.error });
+      return;
+    }
     const body = await readBody(request);
     const account = store.accounts.find((item) => item.id === body.accountId);
     if (!account) {
@@ -449,7 +502,32 @@ async function handleApi(request, response) {
   }
 
   if (request.method === "POST" && url.pathname === "/api/ai/hold-summary") {
+    const user = getSessionUser(request);
+    const limit = checkAiRateLimit(user);
+    if (!limit.ok) {
+      sendJson(response, 429, { ok: false, error: limit.error });
+      return;
+    }
     sendJson(response, 200, { ok: true, summary: buildHoldSummary() });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/ai/chat") {
+    const user = getSessionUser(request);
+    const limit = checkAiRateLimit(user);
+    if (!limit.ok) {
+      sendJson(response, 429, { ok: false, error: limit.error });
+      return;
+    }
+    const body = await readBody(request);
+    const question = String(body.question || "").trim();
+    const accountId = String(body.accountId || "").trim();
+    const account = store.accounts.find((item) => item.id === accountId);
+    const leads = account ? store.leads.filter((lead) => lead.accountId === account.id) : store.leads;
+    const hold = leads.filter((lead) => lead.stageId === "stage-hold").length;
+    const answered = leads.filter((lead) => lead.lastReplyAt).length;
+    const answer = `Системный ответ: ${account ? `${account.id} / ${account.name}` : "все аккаунты"}: ${leads.length} сделок, ${answered} ответов, ${hold} hold. Запрос: ${question || "без уточнения"}.`;
+    sendJson(response, 200, { ok: true, answer });
     return;
   }
 

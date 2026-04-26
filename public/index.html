@@ -62,7 +62,10 @@
           <p class="eyebrow">Рабочий интерфейс</p>
           <h1 id="pageTitle">Аналитика продаж</h1>
         </div>
-        <button class="logout-button" id="logoutButton" type="button">Выйти</button>
+        <div class="top-actions">
+          <button class="secondary-button" id="assistantToggle" type="button">AI помощник</button>
+          <button class="logout-button" id="logoutButton" type="button">Выйти</button>
+        </div>
       </header>
 
       <section id="analytics" class="section active" data-title="Аналитика продаж">
@@ -106,7 +109,7 @@
             <label>Запрос<input name="question" value="Сделай краткую выжимку по продажам, hold и рискам"></label>
             <button type="submit">Получить summary</button>
           </form>
-          <p id="summaryOutput">Выберите аккаунт и запросите summary.</p>
+          <div id="summaryOutput" class="system-answer">Выберите аккаунт и запросите summary.</div>
         </div>
 
         <article class="panel crm-panel">
@@ -146,7 +149,6 @@
           <label>Название базы<input name="filename" value="telegram-contacts.txt"></label>
           <label>Скилл<select name="salesSkill" id="modalSkill"></select></label>
           <label>Таймер<select name="timerProfile" id="modalTimer"></select></label>
-          <label>Набор, сек<input name="typingSeconds" type="number" min="3" max="30" value="5"></label>
           <label class="wide-field">Контакты<textarea name="contacts" rows="4" placeholder="@username или t.me/username, по одному в строке"></textarea></label>
           <label class="wide-field">Промпт<textarea name="promptText" rows="5" placeholder="Общий алгоритм общения, ответы, роль менеджера, исключения и правила hold"></textarea></label>
         </div>
@@ -154,6 +156,24 @@
         <p class="form-message" id="accountMessage"></p>
       </form>
     </div>
+
+    <aside class="assistant-drawer" id="assistantDrawer" hidden>
+      <div class="assistant-head">
+        <div>
+          <strong>AI помощник</strong>
+          <span>Системные ответы по аккаунтам и CRM</span>
+        </div>
+        <button class="icon-button" id="assistantClose" type="button" aria-label="Закрыть">×</button>
+      </div>
+      <form id="assistantForm" class="assistant-form">
+        <label>Account ID<select name="accountId" id="assistantAccount"></select></label>
+        <label>Вопрос<textarea name="question" rows="4" placeholder="Например: что происходит с hold по этому аккаунту?"></textarea></label>
+        <button type="submit">Спросить</button>
+      </form>
+      <div id="assistantMessages" class="assistant-messages">
+        <div class="assistant-message system">Системный помощник готов. Для не-админов действует лимит: 1 запрос в 15 минут.</div>
+      </div>
+    </aside>
 
     <script src="/app.js" type="module"></script>
   </body>

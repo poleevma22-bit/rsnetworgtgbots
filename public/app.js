@@ -32,6 +32,7 @@ const sidebar = document.getElementById("sidebar");
 const pageTitle = document.getElementById("pageTitle");
 const authScreen = document.getElementById("authScreen");
 const accountModal = document.getElementById("accountModal");
+const assistantDrawer = document.getElementById("assistantDrawer");
 
 document.getElementById("burger").addEventListener("click", () => {
   sidebar.classList.toggle("collapsed");
@@ -90,6 +91,37 @@ function timerRows(skill, selected) {
   return optionList(rows, selected || rows[0].id);
 }
 
+function normalizeTelegramText(text = "") {
+  const handles = [
+    ...String(text).matchAll(/(?:^|[\s,;])@([a-zA-Z0-9_]{5,32})\b/g),
+    ...String(text).matchAll(/(?:https?:\/\/)?t\.me\/([a-zA-Z0-9_]{5,32})\b/g)
+  ];
+  return [...new Set(handles.map((match) => `@${match[1]}`))].join("\n");
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary);
+}
+
+async function buildImportPayload(file) {
+  if (/\.(xlsx|xls)$/i.test(file.name)) {
+    return {
+      filename: file.name,
+      fileBase64: arrayBufferToBase64(await file.arrayBuffer())
+    };
+  }
+  const text = await file.text();
+  return {
+    filename: file.name,
+    contacts: normalizeTelegramText(text)
+  };
+}
+
 function setAuthed() {
   document.body.classList.remove("auth-locked");
   authScreen.hidden = true;
@@ -101,12 +133,14 @@ function setSelect(selectId, html) {
 }
 
 function renderOptions() {
+  const accountOptions = snapshot.accounts.length
+    ? snapshot.accounts.map((item) => `<option value="${item.id}">${item.id} / ${item.name}</option>`).join("")
+    : `<option value="">аккаунт не добавлен</option>`;
   setSelect(
     "summaryAccount",
-    snapshot.accounts.length
-      ? snapshot.accounts.map((item) => `<option value="${item.id}">${item.id} / ${item.name}</option>`).join("")
-      : `<option value="">аккаунт не добавлен</option>`
+    accountOptions
   );
+  setSelect("assistantAccount", `<option value="">Все аккаунты</option>${accountOptions}`);
   setSelect(
     "crmAccountFilter",
     `<option value="all">Все аккаунты</option>${snapshot.accounts.map((item) => `<option value="${item.id}" ${crmFilter === item.id ? "selected" : ""}>${item.id} / ${item.name}</option>`).join("")}`
@@ -174,7 +208,7 @@ function renderAccountSettingsTable() {
         </div>
         <label class="file-cell">
           <span>${escapeHtml(binding.database)}</span>
-          <input name="databaseName" value="${escapeHtml(binding.database)}">
+          <input name="contactFile" type="file" accept=".txt,.csv,.xlsx,.xls">
         </label>
         <select name="salesSkill" class="skill-select">
           ${optionList(skills, binding.salesSkill)}
@@ -183,7 +217,7 @@ function renderAccountSettingsTable() {
           <select name="timerProfile" class="timer-select">
             ${timerRows(binding.salesSkill, binding.timerProfile)}
           </select>
-          <label>Набор, сек<input name="typingSeconds" type="number" min="3" max="30" value="${binding.typingSeconds || 5}"></label>
+          <small>Набор встроен: 3-5 секунд</small>
         </div>
         <textarea name="promptText" rows="4" placeholder="Один общий prompt для аккаунта">${escapeHtml(binding.promptText || "")}</textarea>
         <button type="submit">Сохранить</button>
@@ -199,6 +233,27 @@ function renderAccountSettingsTable() {
   });
 
   table.querySelectorAll(".account-settings-form").forEach((form) => {
+    form.querySelector('input[type="file"]').addEventListener("change", async (event) => {
+      const file = event.currentTarget.files[0];
+      if (!file) return;
+      const message = document.getElementById("settingsMessage");
+      message.textContent = `Загрузка базы ${file.name}...`;
+      message.classList.remove("error");
+      try {
+        const payload = await buildImportPayload(file);
+        payload.accountId = form.dataset.accountId;
+        const imported = await api("/api/imports", {
+          method: "POST",
+          body: JSON.stringify(payload)
+        });
+        message.textContent = `База обновлена: ${imported.import.valid} Telegram username, отклонено: ${imported.import.rejected}.`;
+        await refresh();
+      } catch (error) {
+        message.textContent = error.message;
+        message.classList.add("error");
+      }
+    });
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const message = document.getElementById("settingsMessage");
@@ -206,6 +261,7 @@ function renderAccountSettingsTable() {
       message.classList.remove("error");
       try {
         const payload = formPayload(form);
+        delete payload.contactFile;
         payload.accountId = form.dataset.accountId;
         await api("/api/account-settings", {
           method: "POST",
@@ -281,6 +337,20 @@ function renderAll() {
   renderCrmMatrix();
 }
 
+function setSystemAnswer(elementId, text) {
+  const target = document.getElementById(elementId);
+  target.innerHTML = `<div class="system-label">System</div><div>${escapeHtml(text)}</div>`;
+}
+
+function addAssistantMessage(text, type = "system") {
+  const messages = document.getElementById("assistantMessages");
+  const item = document.createElement("div");
+  item.className = `assistant-message ${type}`;
+  item.textContent = text;
+  messages.appendChild(item);
+  messages.scrollTop = messages.scrollHeight;
+}
+
 async function refresh() {
   snapshot = await api("/api/snapshot");
   renderAll();
@@ -316,10 +386,10 @@ document.getElementById("modalContactFile").addEventListener("change", async (ev
   const form = document.getElementById("accountForm");
   form.elements.filename.value = file.name;
   if (/\.(txt|csv)$/i.test(file.name)) {
-    form.elements.contacts.value = await file.text();
+    form.elements.contacts.value = normalizeTelegramText(await file.text());
   } else {
     form.elements.contacts.value = "";
-    document.getElementById("accountMessage").textContent = "Excel-файл выбран. Для разбора XLSX нужен серверный парсер; сейчас будет сохранено имя базы.";
+    document.getElementById("accountMessage").textContent = "Excel-файл выбран. Сервер извлечет Telegram username при сохранении.";
   }
 });
 
@@ -331,10 +401,14 @@ document.getElementById("accountForm").addEventListener("submit", async (event) 
   message.classList.remove("error");
   try {
     const payload = formPayload(form);
-    if (payload.contacts || payload.filename) {
+    const file = document.getElementById("modalContactFile").files[0];
+    if (file) {
+      Object.assign(payload, await buildImportPayload(file));
+    }
+    if (payload.contacts || payload.fileBase64 || payload.filename) {
       const imported = await api("/api/imports", {
         method: "POST",
-        body: JSON.stringify({ filename: payload.filename, contacts: payload.contacts })
+        body: JSON.stringify({ filename: payload.filename, contacts: payload.contacts, fileBase64: payload.fileBase64 })
       });
       payload.databaseId = imported.import.id;
     }
@@ -353,27 +427,48 @@ document.getElementById("accountForm").addEventListener("submit", async (event) 
 
 document.getElementById("summaryForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const output = document.getElementById("summaryOutput");
-  output.textContent = "AI анализирует выбранный account ID...";
+  setSystemAnswer("summaryOutput", "AI анализирует выбранный account ID...");
   try {
     const payload = await api("/api/ai-summary", {
       method: "POST",
       body: JSON.stringify(formPayload(event.currentTarget))
     });
-    output.textContent = payload.summary;
+    setSystemAnswer("summaryOutput", payload.summary);
   } catch (error) {
-    output.textContent = error.message;
+    setSystemAnswer("summaryOutput", error.message);
   }
 });
 
 document.getElementById("holdSummaryButton").addEventListener("click", async () => {
-  const output = document.getElementById("holdSummaryOutput");
-  output.textContent = "Формирую summary по Hold...";
+  setSystemAnswer("holdSummaryOutput", "Формирую summary по Hold...");
   try {
     const payload = await api("/api/ai/hold-summary", { method: "POST", body: "{}" });
-    output.textContent = payload.summary;
+    setSystemAnswer("holdSummaryOutput", payload.summary);
   } catch (error) {
-    output.textContent = error.message;
+    setSystemAnswer("holdSummaryOutput", error.message);
+  }
+});
+
+document.getElementById("assistantToggle").addEventListener("click", () => {
+  assistantDrawer.hidden = false;
+});
+
+document.getElementById("assistantClose").addEventListener("click", () => {
+  assistantDrawer.hidden = true;
+});
+
+document.getElementById("assistantForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = formPayload(event.currentTarget);
+  addAssistantMessage(payload.question || "Запрос без текста", "user");
+  try {
+    const response = await api("/api/ai/chat", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    addAssistantMessage(response.answer, "system");
+  } catch (error) {
+    addAssistantMessage(error.message, "system error");
   }
 });
 
