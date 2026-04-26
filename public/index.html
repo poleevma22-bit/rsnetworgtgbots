@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RS Network CRM</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <aside class="sidebar" id="sidebar">
+      <button class="burger" id="burger" type="button" aria-label="Свернуть меню">
+        <span></span><span></span><span></span>
+      </button>
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <img class="product-logo" src="/assets/rs-network-logo.jpg" alt="">
+        </div>
+        <div class="brand-copy">
+          <strong>RS Network</strong>
+          <span>AI sales workspace</span>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="active" data-section="analytics" data-short="AN" title="Аналитика"><span>Аналитика</span></button>
+        <button data-section="settings" data-short="SET" title="Настройки продаж"><span>Настройки продаж</span></button>
+        <button data-section="crm" data-short="CRM" title="CRM"><span>CRM</span></button>
+      </nav>
+      <div class="policy">
+        <strong>Opt-in only</strong>
+        <small>Базы контактов используются как CRM/AI-контекст. Массовая рассылка не включена.</small>
+      </div>
+    </aside>
+
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Рабочий интерфейс</p>
+          <h1 id="pageTitle">Аналитика продаж</h1>
+        </div>
+        <div class="status-pill" id="backendStatus">backend: проверка</div>
+      </header>
+
+      <section id="analytics" class="section active" data-title="Аналитика продаж">
+        <div class="metric-grid">
+          <article class="metric"><span>Аккаунтов в работе</span><strong id="metricAccounts">0</strong></article>
+          <article class="metric"><span>Сообщений отправлено</span><strong id="metricMessages">0</strong></article>
+          <article class="metric"><span>Контактов в базе</span><strong id="metricContacts">0</strong></article>
+          <article class="metric"><span>Hold</span><strong id="metricHold">0</strong></article>
+        </div>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Выжимка по продажам</h2>
+            <span>обновление раз в 3 часа</span>
+          </div>
+          <div id="analyticsTable" class="sales-table"></div>
+        </article>
+      </section>
+
+      <section id="settings" class="section" data-title="Настройки продаж и скриптов">
+        <div class="settings-stack">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Аккаунты, базы и скрипты</h2>
+              <span>один большой скрипт на аккаунт или группу аккаунтов</span>
+            </div>
+            <div id="accountScriptTable" class="account-script-table"></div>
+            <p class="form-message" id="settingsMessage"></p>
+          </article>
+
+          <form id="promptForm" class="panel compact-form">
+            <div class="panel-head">
+              <h2>Добавить скрипт</h2>
+              <span>общий алгоритм общения</span>
+            </div>
+            <div class="compact-grid">
+              <label>Название<input name="title" value="Новый sales script" required></label>
+              <label>Бизнес-кейс<textarea name="businessCase" rows="3">Квалифицировать входящий интерес и определить следующий шаг.</textarea></label>
+              <label>Шаблоны<textarea name="messageTemplates" rows="3">Здравствуйте. Подскажите, какая задача сейчас приоритетна?
+Какой срок решения для вас комфортен?</textarea></label>
+              <label>Приоритет<textarea name="priorityRules" rows="3">Сначала лиды с понятным бюджетом и сроком до 30 дней.</textarea></label>
+            </div>
+            <button type="submit">Добавить скрипт</button>
+            <p class="form-message" id="promptMessage"></p>
+          </form>
+
+          <form id="importForm" class="panel compact-form">
+            <div class="panel-head">
+              <h2>Загрузить TXT-базу контактов</h2>
+              <span>@username или t.me/username, по одному контакту в строке</span>
+            </div>
+            <div class="compact-grid two">
+              <label>Название базы<input name="filename" value="telegram-contacts.txt"></label>
+              <label>TXT данные<textarea name="contacts" rows="5">@client_ops
+https://t.me/procurement_team
+t.me/founder_north</textarea></label>
+            </div>
+            <button type="submit">Проверить и добавить базу</button>
+            <p class="form-message" id="importMessage"></p>
+          </form>
+        </div>
+      </section>
+
+      <section id="crm" class="section" data-title="CRM матрица">
+        <div class="ai-line panel">
+          <form id="summaryForm">
+            <label>AI summary по account ID<select name="accountId" id="summaryAccount"></select></label>
+            <label>Запрос<input name="question" value="Сделай краткую выжимку по продажам, hold и рискам"></label>
+            <button type="submit">Получить summary</button>
+          </form>
+          <p id="summaryOutput">Выберите аккаунт и запросите summary.</p>
+        </div>
+
+        <article class="panel crm-panel">
+          <div class="panel-head">
+            <h2>Аккаунты x этапы продаж</h2>
+            <span>Hold: пинг клиента раз в месяц; Archive: закрытые и замороженные сделки</span>
+          </div>
+          <div id="crmMatrix" class="crm-matrix"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

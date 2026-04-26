@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="RS Network product logo">
+  <rect width="1024" height="1024" fill="#000000"/>
+  <path
+    d="M230 512C318 354 440 354 512 512C584 670 706 670 794 512C706 354 584 354 512 512C440 670 318 670 230 512Z"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="118"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>
