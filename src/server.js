@@ -1,5 +1,6 @@
 import http from "node:http";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { store, getSnapshot } from "./data.js";
@@ -7,6 +8,8 @@ import { validateAutomationPolicy } from "./safety.js";
 
 const root = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
 const publicDir = join(root, "public");
+const dataDir = join(root, "data");
+const usersPath = join(dataDir, "users.json");
 const port = Number(process.env.PORT || 4173);
 
 const contentTypes = {
@@ -16,8 +19,11 @@ const contentTypes = {
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml; charset=utf-8",
   ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg"
+  ".jpeg": "image/jpeg",
+  ".png": "image/png"
 };
+
+const sessions = new Map();
 
 function sendJson(response, status, payload) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -34,6 +40,48 @@ function parseTelegramContacts(text = "") {
   return { total: rows.length, valid: valid.length, rejected: rows.length - valid.length, sample: valid.slice(0, 5) };
 }
 
+function parseCookies(header = "") {
+  return Object.fromEntries(
+    header
+      .split(";")
+      .map((part) => part.trim().split("="))
+      .filter((pair) => pair.length === 2)
+      .map(([key, value]) => [key, decodeURIComponent(value)])
+  );
+}
+
+function getSessionUser(request) {
+  const token = parseCookies(request.headers.cookie || "").rs_session;
+  if (!token) return null;
+  return sessions.get(token) || null;
+}
+
+async function loadUsers() {
+  try {
+    return JSON.parse(await readFile(usersPath, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+async function saveUsers(users) {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(usersPath, JSON.stringify(users, null, 2), "utf8");
+}
+
+function hashPassword(password, salt = randomBytes(16).toString("hex")) {
+  const hash = scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  const candidate = Buffer.from(hashPassword(password, salt).split(":")[1], "hex");
+  const expected = Buffer.from(hash, "hex");
+  return candidate.length === expected.length && timingSafeEqual(candidate, expected);
+}
+
 async function readBody(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
@@ -45,7 +93,72 @@ async function handleApi(request, response) {
   const url = new URL(request.url, `http://${request.headers.host}`);
 
   if (request.method === "GET" && url.pathname === "/api/snapshot") {
+    if (!getSessionUser(request)) {
+      sendJson(response, 401, { ok: false, error: "Требуется вход" });
+      return;
+    }
     sendJson(response, 200, getSnapshot());
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/session") {
+    const user = getSessionUser(request);
+    sendJson(response, 200, { ok: true, authenticated: Boolean(user), user });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/register") {
+    const body = await readBody(request);
+    const email = String(body.email || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    if (!email.includes("@") || password.length < 8) {
+      sendJson(response, 422, { ok: false, error: "Укажите email и пароль от 8 символов." });
+      return;
+    }
+
+    const users = await loadUsers();
+    if (users.some((user) => user.email === email)) {
+      sendJson(response, 409, { ok: false, error: "Пользователь уже существует." });
+      return;
+    }
+
+    const user = { id: `user-${Date.now()}`, email, passwordHash: hashPassword(password), createdAt: new Date().toISOString() };
+    users.push(user);
+    await saveUsers(users);
+    const token = randomBytes(32).toString("hex");
+    sessions.set(token, { id: user.id, email: user.email });
+    response.setHeader("Set-Cookie", `rs_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`);
+    sendJson(response, 201, { ok: true, user: { id: user.id, email: user.email } });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/login") {
+    const body = await readBody(request);
+    const email = String(body.email || "").trim().toLowerCase();
+    const users = await loadUsers();
+    const user = users.find((item) => item.email === email);
+    if (!user || !verifyPassword(String(body.password || ""), user.passwordHash)) {
+      sendJson(response, 401, { ok: false, error: "Неверный email или пароль." });
+      return;
+    }
+
+    const token = randomBytes(32).toString("hex");
+    sessions.set(token, { id: user.id, email: user.email });
+    response.setHeader("Set-Cookie", `rs_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`);
+    sendJson(response, 200, { ok: true, user: { id: user.id, email: user.email } });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/logout") {
+    const token = parseCookies(request.headers.cookie || "").rs_session;
+    if (token) sessions.delete(token);
+    response.setHeader("Set-Cookie", "rs_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (!getSessionUser(request)) {
+    sendJson(response, 401, { ok: false, error: "Требуется вход" });
     return;
   }
 
@@ -152,6 +265,27 @@ async function handleApi(request, response) {
     account.promptId = body.promptId || account.promptId;
     account.databaseId = body.databaseId || account.databaseId;
     account.scriptNote = body.scriptNote || "";
+    account.salesSkill = body.salesSkill || account.salesSkill || "qualification";
+    account.messageType = body.messageType || account.messageType || "reply";
+    account.repeatIntervalMinutes = Number(body.repeatIntervalMinutes || account.repeatIntervalMinutes || 1440);
+    account.delayedMessage = body.delayedMessage || "";
+    account.queueFallback = body.queueFallback || "";
+    account.persona = body.persona || "";
+    if (body.replyDelaySeconds || body.typingSeconds || body.workingHoursPerDay) {
+      const policy = validateAutomationPolicy({
+        replyDelaySeconds: body.replyDelaySeconds || account.replyDelaySeconds,
+        typingSeconds: body.typingSeconds || account.typingSeconds,
+        workingHoursPerDay: body.workingHoursPerDay || account.workingHoursPerDay,
+        outreachMode: "opt_in"
+      });
+      if (!policy.ok) {
+        sendJson(response, 422, { ok: false, errors: policy.errors });
+        return;
+      }
+      account.replyDelaySeconds = Number(body.replyDelaySeconds || account.replyDelaySeconds);
+      account.typingSeconds = Number(body.typingSeconds || account.typingSeconds);
+      account.workingHoursPerDay = Number(body.workingHoursPerDay || account.workingHoursPerDay);
+    }
     sendJson(response, 200, { ok: true, account });
     return;
   }

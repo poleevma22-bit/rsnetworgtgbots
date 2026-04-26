@@ -6,14 +6,45 @@
     <title>RS Network CRM</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
-  <body>
+  <body class="auth-locked">
+    <section class="auth-screen" id="authScreen">
+      <div class="landing">
+        <img class="landing-logo" src="/assets/rs-network-logo.png" alt="RS Network">
+        <p class="eyebrow">RS Network</p>
+        <h1>AI CRM для Telegram-диалогов и продаж</h1>
+        <p class="landing-copy">Единый кабинет для аккаунтов, скриптов, CRM-статусов, hold-сделок, отложенных сообщений и безопасных клиентских сценариев.</p>
+        <div class="landing-stats">
+          <span>CRM matrix</span>
+          <span>Sales skills</span>
+          <span>Secure login</span>
+        </div>
+      </div>
+      <div class="auth-card">
+        <div class="auth-tabs">
+          <button class="active" type="button" data-auth-tab="login">Вход</button>
+          <button type="button" data-auth-tab="register">Регистрация</button>
+        </div>
+        <form id="loginForm" class="auth-form active">
+          <label>Email<input name="email" type="email" value="admin@rs.local" required></label>
+          <label>Пароль<input name="password" type="password" minlength="8" required></label>
+          <button type="submit">Войти</button>
+        </form>
+        <form id="registerForm" class="auth-form">
+          <label>Email<input name="email" type="email" value="admin@rs.local" required></label>
+          <label>Пароль<input name="password" type="password" minlength="8" required></label>
+          <button type="submit">Создать доступ</button>
+        </form>
+        <p class="form-message" id="authMessage">Данные входа сохраняются на сервере в `data/users.json` с хешем пароля.</p>
+      </div>
+    </section>
+
     <aside class="sidebar" id="sidebar">
       <button class="burger" id="burger" type="button" aria-label="Свернуть меню">
         <span></span><span></span><span></span>
       </button>
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
-          <img class="product-logo" src="/assets/rs-network-logo.jpg" alt="">
+          <img class="product-logo" src="/assets/rs-network-logo.png" alt="">
         </div>
         <div class="brand-copy">
           <strong>RS Network</strong>
@@ -37,7 +68,10 @@
           <p class="eyebrow">Рабочий интерфейс</p>
           <h1 id="pageTitle">Аналитика продаж</h1>
         </div>
-        <div class="status-pill" id="backendStatus">backend: проверка</div>
+        <div class="top-actions">
+          <div class="status-pill" id="backendStatus">backend: проверка</div>
+          <button class="logout-button" id="logoutButton" type="button">Выйти</button>
+        </div>
       </header>
 
       <section id="analytics" class="section active" data-title="Аналитика продаж">
@@ -61,8 +95,8 @@
         <div class="settings-stack">
           <article class="panel">
             <div class="panel-head">
-              <h2>Аккаунты, базы и скрипты</h2>
-              <span>один большой скрипт на аккаунт или группу аккаунтов</span>
+              <h2>Текущие аккаунты в работе</h2>
+              <span>аккаунт, база, prompt, таймеры, скилл и отложенные сообщения</span>
             </div>
             <div id="accountScriptTable" class="account-script-table"></div>
             <p class="form-message" id="settingsMessage"></p>
@@ -86,12 +120,13 @@
 
           <form id="importForm" class="panel compact-form">
             <div class="panel-head">
-              <h2>Загрузить TXT-базу контактов</h2>
-              <span>@username или t.me/username, по одному контакту в строке</span>
+              <h2>Загрузить базу контактов</h2>
+              <span>TXT/CSV/Excel: @username или t.me/username, по одному контакту в строке</span>
             </div>
             <div class="compact-grid two">
+              <label>Файл<input id="contactFile" type="file" accept=".txt,.csv,.xlsx,.xls"></label>
               <label>Название базы<input name="filename" value="telegram-contacts.txt"></label>
-              <label>TXT данные<textarea name="contacts" rows="5">@client_ops
+              <label class="wide-field">Данные<textarea name="contacts" rows="5">@client_ops
 https://t.me/procurement_team
 t.me/founder_north</textarea></label>
             </div>

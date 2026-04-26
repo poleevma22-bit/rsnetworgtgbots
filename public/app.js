@@ -4,9 +4,19 @@ const sections = document.querySelectorAll(".section");
 const navButtons = document.querySelectorAll(".nav button");
 const sidebar = document.getElementById("sidebar");
 const pageTitle = document.getElementById("pageTitle");
+const authScreen = document.getElementById("authScreen");
 
 document.getElementById("burger").addEventListener("click", () => {
   sidebar.classList.toggle("collapsed");
+});
+
+document.querySelectorAll("[data-auth-tab]").forEach((button) => {
+  button.addEventListener("click", () => {
+    document.querySelectorAll("[data-auth-tab]").forEach((item) => item.classList.remove("active"));
+    document.querySelectorAll(".auth-form").forEach((form) => form.classList.remove("active"));
+    button.classList.add("active");
+    document.getElementById(`${button.dataset.authTab}Form`).classList.add("active");
+  });
 });
 
 navButtons.forEach((button) => {
@@ -34,6 +44,12 @@ async function api(path, options = {}) {
 
 function formPayload(form) {
   return Object.fromEntries(new FormData(form).entries());
+}
+
+function setAuthed(user) {
+  document.body.classList.remove("auth-locked");
+  authScreen.hidden = true;
+  document.getElementById("backendStatus").textContent = `user: ${user.email}`;
 }
 
 function options(rows, selected, labeler) {
@@ -93,9 +109,10 @@ function renderAccountScriptTable() {
   table.innerHTML = `
     <div class="script-row header">
       <span>Аккаунт</span>
-      <span>TXT база</span>
-      <span>Скрипт</span>
-      <span>Общий промпт / алгоритм</span>
+      <span>База / prompt</span>
+      <span>Скилл / тип</span>
+      <span>Таймеры</span>
+      <span>Сценарий</span>
       <span></span>
     </div>
     ${snapshot.bindings.map((binding) => `
@@ -104,9 +121,37 @@ function renderAccountScriptTable() {
           <strong>${binding.accountId}</strong>
           <small>${binding.accountName}</small>
         </div>
-        <select name="databaseId">${options(snapshot.databases, binding.databaseId, (item) => item.filename)}</select>
-        <select name="promptId">${options(snapshot.prompts, binding.promptId, (item) => item.title)}</select>
-        <textarea name="scriptNote" rows="3">${binding.scriptNote || ""}</textarea>
+        <div class="cell-stack">
+          <select name="databaseId">${options(snapshot.databases, binding.databaseId, (item) => item.filename)}</select>
+          <select name="promptId">${options(snapshot.prompts, binding.promptId, (item) => item.title)}</select>
+        </div>
+        <div class="cell-stack">
+          <select name="salesSkill">
+            <option value="qualification" ${binding.salesSkill === "qualification" ? "selected" : ""}>Квалификация</option>
+            <option value="objection_handling" ${binding.salesSkill === "objection_handling" ? "selected" : ""}>Работа с возражениями</option>
+            <option value="regular_followup" ${binding.salesSkill === "regular_followup" ? "selected" : ""}>Регулярный follow-up</option>
+            <option value="queue_reaction" ${binding.salesSkill === "queue_reaction" ? "selected" : ""}>Очередь и задержка</option>
+            <option value="informal_dialog" ${binding.salesSkill === "informal_dialog" ? "selected" : ""}>Неформальный диалог</option>
+          </select>
+          <select name="messageType">
+            <option value="opt_in_intro" ${binding.messageType === "opt_in_intro" ? "selected" : ""}>Первичное opt-in</option>
+            <option value="reply" ${binding.messageType === "reply" ? "selected" : ""}>Ответ клиенту</option>
+            <option value="scheduled" ${binding.messageType === "scheduled" ? "selected" : ""}>Отложенное</option>
+            <option value="queue_update" ${binding.messageType === "queue_update" ? "selected" : ""}>Очередь</option>
+            <option value="hold_ping" ${binding.messageType === "hold_ping" ? "selected" : ""}>Hold ping</option>
+          </select>
+        </div>
+        <div class="cell-stack">
+          <input name="typingSeconds" type="number" min="8" value="${binding.typingSeconds}" title="Время набора">
+          <input name="replyDelaySeconds" type="number" min="60" value="${binding.replyDelaySeconds}" title="Минимальное время ответа">
+          <input name="repeatIntervalMinutes" type="number" min="60" value="${binding.repeatIntervalMinutes}" title="Повтор, минут">
+        </div>
+        <div class="cell-stack">
+          <textarea name="scriptNote" rows="2" placeholder="Общий prompt / алгоритм">${binding.scriptNote || ""}</textarea>
+          <textarea name="persona" rows="2" placeholder="Роль оператора / тональность">${binding.persona || ""}</textarea>
+          <textarea name="delayedMessage" rows="2" placeholder="Отложенное сообщение">${binding.delayedMessage || ""}</textarea>
+          <textarea name="queueFallback" rows="2" placeholder="Сообщение при задержке / очереди">${binding.queueFallback || ""}</textarea>
+        </div>
         <div class="script-actions">
           <label class="checkline"><input type="checkbox" name="exclusiveScript" value="true" checked> без конфликта</label>
           <button type="submit">Сохранить</button>
@@ -231,6 +276,19 @@ document.getElementById("importForm").addEventListener("submit", (event) => {
   submitJson(event.currentTarget, "/api/imports", "importMessage");
 });
 
+document.getElementById("contactFile").addEventListener("change", async (event) => {
+  const file = event.currentTarget.files[0];
+  if (!file) return;
+  const form = document.getElementById("importForm");
+  form.elements.filename.value = file.name;
+  if (/\.(txt|csv)$/i.test(file.name)) {
+    form.elements.contacts.value = await file.text();
+  } else {
+    form.elements.contacts.value = "";
+    document.getElementById("importMessage").textContent = "Excel-файл выбран. Для полноценного парсинга на сервере нужен XLSX-парсер; сейчас будет сохранено имя базы.";
+  }
+});
+
 document.getElementById("summaryForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const output = document.getElementById("summaryOutput");
@@ -246,6 +304,44 @@ document.getElementById("summaryForm").addEventListener("submit", async (event) 
   }
 });
 
-refresh().catch((error) => {
-  document.getElementById("backendStatus").textContent = `backend: ${error.message}`;
+async function authSubmit(form, path) {
+  const message = document.getElementById("authMessage");
+  message.textContent = "Проверка...";
+  message.classList.remove("error");
+  try {
+    const payload = await api(path, {
+      method: "POST",
+      body: JSON.stringify(formPayload(form))
+    });
+    setAuthed(payload.user);
+    await refresh();
+  } catch (error) {
+    message.textContent = error.message;
+    message.classList.add("error");
+  }
+}
+
+document.getElementById("loginForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  authSubmit(event.currentTarget, "/api/login");
 });
+
+document.getElementById("registerForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  authSubmit(event.currentTarget, "/api/register");
+});
+
+document.getElementById("logoutButton").addEventListener("click", async () => {
+  await api("/api/logout", { method: "POST", body: "{}" });
+  document.body.classList.add("auth-locked");
+  authScreen.hidden = false;
+});
+
+api("/api/session")
+  .then(async (payload) => {
+    if (payload.authenticated) {
+      setAuthed(payload.user);
+      await refresh();
+    }
+  })
+  .catch(() => {});
