@@ -44,6 +44,33 @@ function parseTelegramContacts(text = "") {
   return { total: rows.length, valid: valid.length, rejected: rows.length - valid.length, sample: valid.slice(0, 5) };
 }
 
+function resolveTimerProfile(timerProfile = "wait_60s") {
+  const profiles = {
+    wait_60s: { replyDelaySeconds: 60, repeatIntervalMinutes: null },
+    wait_5m: { replyDelaySeconds: 300, repeatIntervalMinutes: null },
+    wait_10m: { replyDelaySeconds: 600, repeatIntervalMinutes: null },
+    wait_15m: { replyDelaySeconds: 900, repeatIntervalMinutes: null },
+    wait_30m: { replyDelaySeconds: 1800, repeatIntervalMinutes: null },
+    repeat_2d: { replyDelaySeconds: 60, repeatIntervalMinutes: 2880 },
+    repeat_7d: { replyDelaySeconds: 60, repeatIntervalMinutes: 10080 },
+    repeat_14d: { replyDelaySeconds: 60, repeatIntervalMinutes: 20160 },
+    repeat_30d: { replyDelaySeconds: 60, repeatIntervalMinutes: 43200 }
+  };
+  return profiles[timerProfile] || profiles.wait_60s;
+}
+
+function buildHoldSummary() {
+  const holds = store.leads.filter((lead) => lead.stageId === "stage-hold");
+  if (!holds.length) return "Hold пустой: зависших сделок сейчас нет.";
+  return holds
+    .map((lead) => {
+      const account = store.accounts.find((item) => item.id === lead.accountId);
+      const nextPing = lead.nextPingAt ? new Date(lead.nextPingAt).toLocaleDateString("ru-RU") : "пинг не назначен";
+      return `${lead.telegram} / ${account?.id || "без аккаунта"}: ${lead.status} Следующий пинг: ${nextPing}. Комментарий: ${lead.comment || "нет"}.`;
+    })
+    .join(" ");
+}
+
 function parseCookies(header = "") {
   return Object.fromEntries(
     header
@@ -269,7 +296,13 @@ async function handleApi(request, response) {
 
   if (request.method === "POST" && url.pathname === "/api/accounts") {
     const body = await readBody(request);
-    const policy = validateAutomationPolicy(body);
+    const timer = resolveTimerProfile(body.timerProfile);
+    const policy = validateAutomationPolicy({
+      replyDelaySeconds: body.replyDelaySeconds || timer.replyDelaySeconds,
+      typingSeconds: body.typingSeconds || 5,
+      workingHoursPerDay: body.workingHoursPerDay || 6,
+      outreachMode: "opt_in"
+    });
     if (!policy.ok) {
       sendJson(response, 422, { ok: false, errors: policy.errors });
       return;
@@ -277,17 +310,20 @@ async function handleApi(request, response) {
 
     const account = {
       id: body.id || `tg-${Date.now()}`,
-      name: body.name,
-      handle: body.handle,
+      name: body.name || body.id || "Telegram account",
+      handle: body.handle || "",
       avatarUrl: body.avatarUrl || "",
       status: "pending",
       health: "review",
       connector: body.connector || "Telegram API app",
-      promptId: body.promptId,
       databaseId: body.databaseId,
-      replyDelaySeconds: Number(body.replyDelaySeconds),
-      typingSeconds: Number(body.typingSeconds),
-      workingHoursPerDay: Number(body.workingHoursPerDay),
+      salesSkill: body.salesSkill || "first_contact",
+      timerProfile: body.timerProfile || "wait_60s",
+      promptText: body.promptText || "",
+      replyDelaySeconds: Number(body.replyDelaySeconds || timer.replyDelaySeconds),
+      repeatIntervalMinutes: timer.repeatIntervalMinutes,
+      typingSeconds: Number(body.typingSeconds || 5),
+      workingHoursPerDay: Number(body.workingHoursPerDay || 6),
       messagesSent: 0
     };
 
@@ -361,36 +397,25 @@ async function handleApi(request, response) {
       return;
     }
 
-    const samePromptAccounts = store.accounts.filter((item) => item.id !== account.id && item.promptId === body.promptId);
-    if (samePromptAccounts.length && body.exclusiveScript === "true") {
-      sendJson(response, 409, { ok: false, error: "Этот скрипт уже закреплен за другим аккаунтом." });
+    const timer = resolveTimerProfile(body.timerProfile || account.timerProfile);
+    const policy = validateAutomationPolicy({
+      replyDelaySeconds: timer.replyDelaySeconds,
+      typingSeconds: body.typingSeconds || account.typingSeconds || 5,
+      workingHoursPerDay: body.workingHoursPerDay || account.workingHoursPerDay || 6,
+      outreachMode: "opt_in"
+    });
+    if (!policy.ok) {
+      sendJson(response, 422, { ok: false, errors: policy.errors });
       return;
     }
 
-    account.promptId = body.promptId || account.promptId;
-    account.databaseId = body.databaseId || account.databaseId;
-    account.scriptNote = body.scriptNote || "";
-    account.salesSkill = body.salesSkill || account.salesSkill || "qualification";
-    account.messageType = body.messageType || account.messageType || "reply";
-    account.repeatIntervalMinutes = Number(body.repeatIntervalMinutes || account.repeatIntervalMinutes || 1440);
-    account.delayedMessage = body.delayedMessage || "";
-    account.queueFallback = body.queueFallback || "";
-    account.persona = body.persona || "";
-    if (body.replyDelaySeconds || body.typingSeconds || body.workingHoursPerDay) {
-      const policy = validateAutomationPolicy({
-        replyDelaySeconds: body.replyDelaySeconds || account.replyDelaySeconds,
-        typingSeconds: body.typingSeconds || account.typingSeconds,
-        workingHoursPerDay: body.workingHoursPerDay || account.workingHoursPerDay,
-        outreachMode: "opt_in"
-      });
-      if (!policy.ok) {
-        sendJson(response, 422, { ok: false, errors: policy.errors });
-        return;
-      }
-      account.replyDelaySeconds = Number(body.replyDelaySeconds || account.replyDelaySeconds);
-      account.typingSeconds = Number(body.typingSeconds || account.typingSeconds);
-      account.workingHoursPerDay = Number(body.workingHoursPerDay || account.workingHoursPerDay);
-    }
+    account.salesSkill = body.salesSkill || account.salesSkill || "first_contact";
+    account.timerProfile = body.timerProfile || account.timerProfile || "wait_60s";
+    account.promptText = body.promptText || "";
+    account.replyDelaySeconds = timer.replyDelaySeconds;
+    account.repeatIntervalMinutes = timer.repeatIntervalMinutes;
+    account.typingSeconds = Number(body.typingSeconds || account.typingSeconds || 5);
+    account.workingHoursPerDay = Number(body.workingHoursPerDay || account.workingHoursPerDay || 6);
     sendJson(response, 200, { ok: true, account });
     return;
   }
@@ -420,6 +445,11 @@ async function handleApi(request, response) {
     const answered = leads.filter((lead) => lead.lastReplyAt).length;
     const summary = `${account.id}: ${leads.length} сделок, ${answered} с ответом. ${leads.map((lead) => `${lead.telegram} - ${lead.status}`).join(" ")}`;
     sendJson(response, 200, { ok: true, summary, question: body.question || "" });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/ai/hold-summary") {
+    sendJson(response, 200, { ok: true, summary: buildHoldSummary() });
     return;
   }
 

@@ -1,5 +1,5 @@
 export const MIN_REPLY_DELAY_SECONDS = 60;
-export const MIN_TYPING_SECONDS = 8;
+export const MIN_TYPING_SECONDS = 3;
 export const MAX_WORKING_HOURS_PER_DAY = 8;
 
 export function validateAutomationPolicy(settings = {}) {

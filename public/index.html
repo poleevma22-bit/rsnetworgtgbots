@@ -12,7 +12,7 @@
         <img class="landing-logo" src="/assets/rs-network-logo.png" alt="RS Network">
         <p class="eyebrow">RS Network</p>
         <h1>Telegram AI sales CRM</h1>
-        <p class="landing-copy">Система для Telegram AI продаж с гибкой настройкой промптов, аккаунтов, клиентов и CRM.</p>
+        <p class="landing-copy">Система для Telegram AI продаж и CRM с гибкой настройкой промптов.</p>
       </div>
 
       <div class="auth-card">
@@ -51,10 +51,9 @@
       <nav class="nav">
         <button class="active" data-section="analytics" data-icon="analytics" title="Аналитика"><span class="nav-icon"></span><span>Аналитика</span></button>
         <button data-section="settings" data-icon="sales" title="Настройки продаж"><span class="nav-icon"></span><span>Настройки продаж</span></button>
-        <button data-section="clients" data-icon="clients" title="Клиенты"><span class="nav-icon"></span><span>Клиенты</span></button>
         <button data-section="crm" data-icon="crm" title="CRM"><span class="nav-icon"></span><span>CRM</span></button>
       </nav>
-      <small class="nav-note">Opt-in CRM/AI контур. Массовая рассылка не включена.</small>
+      <small class="nav-note">Opt-in CRM/AI контур. Массовая неразрешенная рассылка не включена.</small>
     </aside>
 
     <main class="app">
@@ -63,114 +62,47 @@
           <p class="eyebrow">Рабочий интерфейс</p>
           <h1 id="pageTitle">Аналитика продаж</h1>
         </div>
-        <div class="top-actions">
-          <div class="status-pill" id="backendStatus">backend: проверка</div>
-          <button class="logout-button" id="logoutButton" type="button">Выйти</button>
-        </div>
+        <button class="logout-button" id="logoutButton" type="button">Выйти</button>
       </header>
 
       <section id="analytics" class="section active" data-title="Аналитика продаж">
         <div class="metric-grid">
           <article class="metric"><span>Аккаунтов в работе</span><strong id="metricAccounts">0</strong></article>
           <article class="metric"><span>Сообщений отправлено</span><strong id="metricMessages">0</strong></article>
-          <article class="metric"><span>Контактов в базе</span><strong id="metricContacts">0</strong></article>
-          <article class="metric"><span>Hold</span><strong id="metricHold">0</strong></article>
+          <article class="metric"><span>Ответов получено</span><strong id="metricReplies">0</strong></article>
+          <article class="metric hold-metric"><span>Hold</span><strong id="metricHold">0</strong><button id="holdSummaryButton" type="button">Summary</button></article>
         </div>
 
         <article class="panel">
           <div class="panel-head">
-            <h2>Выжимка по продажам</h2>
-            <span>обновление раз в 3 часа</span>
+            <div>
+              <h2>Выжимка по продажам</h2>
+              <span>обновление раз в 3 часа</span>
+            </div>
           </div>
           <div id="analyticsTable" class="sales-table"></div>
+          <p id="holdSummaryOutput" class="summary-output"></p>
         </article>
       </section>
 
-      <section id="settings" class="section" data-title="Настройки продаж и скриптов">
-        <div class="settings-stack">
-          <article class="panel">
-            <div class="panel-head">
-              <h2>Текущие аккаунты в работе</h2>
-              <span>аккаунт, база, prompt, таймеры, скилл и отложенные сообщения</span>
+      <section id="settings" class="section" data-title="Настройки продаж">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Аккаунты в работе</h2>
+              <span>аккаунт, база контактов, скилл, таймер и один общий промпт</span>
             </div>
-            <div id="accountScriptTable" class="account-script-table"></div>
-            <p class="form-message" id="settingsMessage"></p>
-          </article>
-
-          <form id="promptForm" class="panel compact-form">
-            <div class="panel-head">
-              <h2>Добавить скрипт</h2>
-              <span>общий алгоритм общения</span>
-            </div>
-            <div class="compact-grid">
-              <label>Название<input name="title" value="Новый sales script" required></label>
-              <label>Бизнес-кейс<textarea name="businessCase" rows="3">Квалифицировать входящий интерес и определить следующий шаг.</textarea></label>
-              <label>Шаблоны<textarea name="messageTemplates" rows="3">Здравствуйте. Подскажите, какая задача сейчас приоритетна?
-Какой срок решения для вас комфортен?</textarea></label>
-              <label>Приоритет<textarea name="priorityRules" rows="3">Сначала лиды с понятным бюджетом и сроком до 30 дней.</textarea></label>
-            </div>
-            <button type="submit">Добавить скрипт</button>
-            <p class="form-message" id="promptMessage"></p>
-          </form>
-
-          <form id="importForm" class="panel compact-form">
-            <div class="panel-head">
-              <h2>Загрузить базу контактов</h2>
-              <span>TXT/CSV/Excel: @username или t.me/username, по одному контакту в строке</span>
-            </div>
-            <div class="compact-grid two">
-              <label>Файл<input id="contactFile" type="file" accept=".txt,.csv,.xlsx,.xls"></label>
-              <label>Название базы<input name="filename" value="telegram-contacts.txt"></label>
-              <label class="wide-field">Данные<textarea name="contacts" rows="5">@client_ops
-https://t.me/procurement_team
-t.me/founder_north</textarea></label>
-            </div>
-            <button type="submit">Проверить и добавить базу</button>
-            <p class="form-message" id="importMessage"></p>
-          </form>
-        </div>
-      </section>
-
-      <section id="clients" class="section" data-title="Клиенты и Telegram Cloud Bot">
-        <div class="settings-stack">
-          <form id="clientForm" class="panel compact-form">
-            <div class="panel-head">
-              <h2>Добавить клиента</h2>
-              <span>отдельный бренд и контур управления</span>
-            </div>
-            <div class="compact-grid">
-              <label>Название клиента<input name="name" value="Demo Client" required></label>
-              <label>Бренд<input name="brand" value="Demo Client"></label>
-              <label>Email владельца<input name="ownerEmail" type="email" value="owner@example.com"></label>
-            </div>
-            <button type="submit">Создать клиента</button>
-            <p class="form-message" id="clientMessage"></p>
-          </form>
-
-          <article class="panel">
-            <div class="panel-head">
-              <h2>Клиенты</h2>
-              <span>бренды внутри системы</span>
-            </div>
-            <div id="clientTable" class="sales-table"></div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <h2>Telegram Cloud Bot API</h2>
-              <span>webhook endpoint для Bot API</span>
-            </div>
-            <div id="telegramStatus" class="api-box"></div>
-            <button id="setWebhookButton" type="button" class="secondary-button">Подключить webhook</button>
-            <p class="form-message" id="telegramMessage"></p>
-          </article>
-        </div>
+            <button id="openAccountModal" class="secondary-button" type="button">Добавить аккаунт</button>
+          </div>
+          <div id="accountSettingsTable" class="settings-table"></div>
+          <p class="form-message" id="settingsMessage"></p>
+        </article>
       </section>
 
       <section id="crm" class="section" data-title="CRM матрица">
         <div class="ai-line panel">
           <form id="summaryForm">
-            <label>AI summary по account ID<select name="accountId" id="summaryAccount"></select></label>
+            <label>Account ID<select name="accountId" id="summaryAccount"></select></label>
             <label>Запрос<input name="question" value="Сделай краткую выжимку по продажам, hold и рискам"></label>
             <button type="submit">Получить summary</button>
           </form>
@@ -179,13 +111,49 @@ t.me/founder_north</textarea></label>
 
         <article class="panel crm-panel">
           <div class="panel-head">
-            <h2>Аккаунты x этапы продаж</h2>
-            <span>Hold: пинг клиента раз в месяц; Archive: закрытые и замороженные сделки</span>
+            <div>
+              <h2>Аккаунты x этапы продаж</h2>
+              <span>Hold: пинг раз в месяц; Archive: закрытые и замороженные сделки</span>
+            </div>
+            <label class="compact-select">Фильтр аккаунта<select id="crmAccountFilter"></select></label>
           </div>
           <div id="crmMatrix" class="crm-matrix"></div>
         </article>
       </section>
+
+      <footer class="app-footer">
+        <a href="#">Privacy policy</a>
+        <a href="#">KYC</a>
+        <a href="#">Security</a>
+        <span>support@rs.network</span>
+      </footer>
     </main>
+
+    <div class="modal" id="accountModal" hidden>
+      <form class="modal-card" id="accountForm">
+        <div class="panel-head">
+          <div>
+            <h2>Добавить аккаунт</h2>
+            <span>ID и тег используются для всей аналитики и CRM</span>
+          </div>
+          <button class="icon-button" id="closeAccountModal" type="button" aria-label="Закрыть">×</button>
+        </div>
+        <div class="modal-grid">
+          <label>Account ID<input name="id" placeholder="tg-100500" required></label>
+          <label>Тег / имя<input name="name" placeholder="Sales Moscow" required></label>
+          <label>Username<input name="handle" placeholder="@sales_moscow"></label>
+          <label>База контактов<input id="modalContactFile" type="file" accept=".txt,.csv,.xlsx,.xls"></label>
+          <label>Название базы<input name="filename" value="telegram-contacts.txt"></label>
+          <label>Скилл<select name="salesSkill" id="modalSkill"></select></label>
+          <label>Таймер<select name="timerProfile" id="modalTimer"></select></label>
+          <label>Набор, сек<input name="typingSeconds" type="number" min="3" max="30" value="5"></label>
+          <label class="wide-field">Контакты<textarea name="contacts" rows="4" placeholder="@username или t.me/username, по одному в строке"></textarea></label>
+          <label class="wide-field">Промпт<textarea name="promptText" rows="5" placeholder="Общий алгоритм общения, ответы, роль менеджера, исключения и правила hold"></textarea></label>
+        </div>
+        <button type="submit">Сохранить аккаунт</button>
+        <p class="form-message" id="accountMessage"></p>
+      </form>
+    </div>
 
     <script src="/app.js" type="module"></script>
   </body>

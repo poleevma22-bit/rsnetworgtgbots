@@ -1,10 +1,37 @@
 let snapshot = null;
+let crmFilter = "all";
+
+const skills = [
+  { id: "first_contact", label: "Первичный контакт" },
+  { id: "qualification", label: "Квалификация" },
+  { id: "objection_handling", label: "Работа с возражениями" },
+  { id: "delayed_message", label: "Отложенное сообщение" },
+  { id: "regular_followup", label: "Регулярные сообщения" },
+  { id: "queue_reaction", label: "Очередь и задержка" },
+  { id: "informal_dialog", label: "Неформальный диалог" }
+];
+
+const waitTimers = [
+  { id: "wait_60s", label: "Игнор 1 минута" },
+  { id: "wait_5m", label: "Игнор 5 минут" },
+  { id: "wait_10m", label: "Игнор 10 минут" },
+  { id: "wait_15m", label: "Игнор 15 минут" },
+  { id: "wait_30m", label: "Игнор 30 минут" }
+];
+
+const regularTimers = [
+  { id: "repeat_2d", label: "Повтор раз в 2 дня" },
+  { id: "repeat_7d", label: "Повтор раз в неделю" },
+  { id: "repeat_14d", label: "Повтор раз в 2 недели" },
+  { id: "repeat_30d", label: "Повтор раз в месяц" }
+];
 
 const sections = document.querySelectorAll(".section");
 const navButtons = document.querySelectorAll(".nav button");
 const sidebar = document.getElementById("sidebar");
 const pageTitle = document.getElementById("pageTitle");
 const authScreen = document.getElementById("authScreen");
+const accountModal = document.getElementById("accountModal");
 
 document.getElementById("burger").addEventListener("click", () => {
   sidebar.classList.toggle("collapsed");
@@ -46,153 +73,130 @@ function formPayload(form) {
   return Object.fromEntries(new FormData(form).entries());
 }
 
-function setAuthed(user) {
+function escapeHtml(value = "") {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function optionList(rows, selected) {
+  return rows.map((row) => `<option value="${row.id}" ${row.id === selected ? "selected" : ""}>${row.label}</option>`).join("");
+}
+
+function timerRows(skill, selected) {
+  const rows = skill === "regular_followup" ? regularTimers : waitTimers;
+  return optionList(rows, selected || rows[0].id);
+}
+
+function setAuthed() {
   document.body.classList.remove("auth-locked");
   authScreen.hidden = true;
-  document.getElementById("backendStatus").textContent = `user: ${user.email}`;
 }
 
-function options(rows, selected, labeler) {
-  return rows.map((row) => `<option value="${row.id}" ${row.id === selected ? "selected" : ""}>${labeler(row)}</option>`).join("");
-}
-
-function setOptions(selectId, rows, emptyText, labeler = (item) => item.name || item.title || item.filename) {
+function setSelect(selectId, html) {
   const select = document.getElementById(selectId);
-  if (!select) return;
-  if (!rows.length) {
-    select.innerHTML = `<option value="">${emptyText}</option>`;
-    select.disabled = true;
-    return;
-  }
-
-  select.disabled = false;
-  select.innerHTML = rows.map((row) => `<option value="${row.id}">${labeler(row)}</option>`).join("");
+  if (select) select.innerHTML = html;
 }
 
 function renderOptions() {
-  setOptions("summaryAccount", snapshot.accounts, "аккаунт не добавлен", (item) => `${item.id} / ${item.name}`);
+  setSelect(
+    "summaryAccount",
+    snapshot.accounts.length
+      ? snapshot.accounts.map((item) => `<option value="${item.id}">${item.id} / ${item.name}</option>`).join("")
+      : `<option value="">аккаунт не добавлен</option>`
+  );
+  setSelect(
+    "crmAccountFilter",
+    `<option value="all">Все аккаунты</option>${snapshot.accounts.map((item) => `<option value="${item.id}" ${crmFilter === item.id ? "selected" : ""}>${item.id} / ${item.name}</option>`).join("")}`
+  );
+  setSelect("modalSkill", optionList(skills, "first_contact"));
+  setSelect("modalTimer", timerRows("first_contact", "wait_60s"));
 }
 
 function renderMetrics() {
   document.getElementById("metricAccounts").textContent = snapshot.analytics.accountsInWork;
   document.getElementById("metricMessages").textContent = snapshot.analytics.messagesSent;
-  document.getElementById("metricContacts").textContent = snapshot.analytics.contactsTotal;
+  document.getElementById("metricReplies").textContent = snapshot.analytics.answered;
   document.getElementById("metricHold").textContent = snapshot.analytics.hold;
 }
 
 function renderAnalyticsTable() {
   document.getElementById("analyticsTable").innerHTML = `
-    <div class="row header"><span>Account ID</span><span>Статус</span><span>Сообщения</span><span>Контакты</span><span>Hold</span></div>
+    <div class="row header analytics-row">
+      <span>Account ID</span><span>Статус</span><span>Сообщения</span><span>Replies</span><span>Hold</span><span>Оффер</span><span>Онбординг</span><span>Hot leads</span>
+    </div>
     ${snapshot.accounts.map((account) => {
       const leads = snapshot.leads.filter((lead) => lead.accountId === account.id);
+      const replies = leads.filter((lead) => lead.lastReplyAt).length;
       const hold = leads.filter((lead) => lead.stageId === "stage-hold").length;
+      const offer = leads.filter((lead) => lead.stageId === "stage-offer").length;
+      const onboarding = leads.filter((lead) => lead.stageId === "stage-onboarding").length;
+      const hot = leads.filter((lead) => ["stage-3", "stage-4", "stage-offer"].includes(lead.stageId)).length;
       return `
-        <div class="row">
-          <span>${account.id}<small>${account.name}</small></span>
-          <span>${account.status} / ${account.health}</span>
+        <div class="row analytics-row">
+          <span>${account.id}<small>${escapeHtml(account.name)}</small></span>
+          <span>${escapeHtml(account.status)} / ${escapeHtml(account.health)}</span>
           <span>${account.messagesSent}</span>
-          <span>${leads.length}</span>
+          <span>${replies}</span>
           <span>${hold}</span>
+          <span>${offer}</span>
+          <span>${onboarding}</span>
+          <span>${hot}</span>
         </div>
       `;
     }).join("")}
   `;
 }
 
-function renderClients() {
-  const table = document.getElementById("clientTable");
-  if (!table) return;
-  table.innerHTML = `
-    <div class="row header"><span>ID</span><span>Клиент</span><span>Бренд</span><span>Владелец</span><span>Статус</span></div>
-    ${snapshot.clients.map((client) => `
-      <div class="row">
-        <span>${client.id}</span>
-        <span>${client.name}</span>
-        <span>${client.brand}</span>
-        <span>${client.ownerEmail || "-"}</span>
-        <span>${client.status}</span>
-      </div>
-    `).join("")}
-  `;
-}
-
-async function renderTelegramStatus() {
-  const box = document.getElementById("telegramStatus");
-  if (!box) return;
-  try {
-    const payload = await api("/api/telegram/status");
-    const tg = payload.telegram;
-    box.innerHTML = `
-      <div><strong>Webhook path</strong><span>${tg.webhookPath}</span></div>
-      <div><strong>Bot token</strong><span>${tg.configured ? "configured" : "not configured"}</span></div>
-      <div><strong>Public URL</strong><span>${tg.publicWebhookUrl || "not configured"}</span></div>
-      <div><strong>Secret</strong><span>${tg.hasSecret ? "configured" : "not configured"}</span></div>
-    `;
-  } catch (error) {
-    box.textContent = error.message;
-  }
-}
-
-function renderAccountScriptTable() {
-  const table = document.getElementById("accountScriptTable");
+function renderAccountSettingsTable() {
+  const table = document.getElementById("accountSettingsTable");
   if (!snapshot.accounts.length) {
     table.innerHTML = `<div class="empty-state">аккаунт не добавлен</div>`;
     return;
   }
 
   table.innerHTML = `
-    <div class="script-row header">
+    <div class="settings-row header">
       <span>Аккаунт</span>
-      <span>База / prompt</span>
-      <span>Скилл / тип</span>
-      <span>Таймеры</span>
-      <span>Сценарий</span>
+      <span>База контактов</span>
+      <span>Скилл</span>
+      <span>Таймер</span>
+      <span>Промпт</span>
       <span></span>
     </div>
     ${snapshot.bindings.map((binding) => `
-      <form class="script-row account-settings-form" data-account-id="${binding.accountId}">
+      <form class="settings-row account-settings-form" data-account-id="${binding.accountId}">
         <div>
           <strong>${binding.accountId}</strong>
-          <small>${binding.accountName}</small>
+          <small>${escapeHtml(binding.accountName)}</small>
         </div>
-        <div class="cell-stack">
-          <select name="databaseId">${options(snapshot.databases, binding.databaseId, (item) => item.filename)}</select>
-          <select name="promptId">${options(snapshot.prompts, binding.promptId, (item) => item.title)}</select>
-        </div>
-        <div class="cell-stack">
-          <select name="salesSkill">
-            <option value="qualification" ${binding.salesSkill === "qualification" ? "selected" : ""}>Квалификация</option>
-            <option value="objection_handling" ${binding.salesSkill === "objection_handling" ? "selected" : ""}>Работа с возражениями</option>
-            <option value="regular_followup" ${binding.salesSkill === "regular_followup" ? "selected" : ""}>Регулярный follow-up</option>
-            <option value="queue_reaction" ${binding.salesSkill === "queue_reaction" ? "selected" : ""}>Очередь и задержка</option>
-            <option value="informal_dialog" ${binding.salesSkill === "informal_dialog" ? "selected" : ""}>Неформальный диалог</option>
+        <label class="file-cell">
+          <span>${escapeHtml(binding.database)}</span>
+          <input name="databaseName" value="${escapeHtml(binding.database)}">
+        </label>
+        <select name="salesSkill" class="skill-select">
+          ${optionList(skills, binding.salesSkill)}
+        </select>
+        <div class="timer-cell">
+          <select name="timerProfile" class="timer-select">
+            ${timerRows(binding.salesSkill, binding.timerProfile)}
           </select>
-          <select name="messageType">
-            <option value="opt_in_intro" ${binding.messageType === "opt_in_intro" ? "selected" : ""}>Первичное opt-in</option>
-            <option value="reply" ${binding.messageType === "reply" ? "selected" : ""}>Ответ клиенту</option>
-            <option value="scheduled" ${binding.messageType === "scheduled" ? "selected" : ""}>Отложенное</option>
-            <option value="queue_update" ${binding.messageType === "queue_update" ? "selected" : ""}>Очередь</option>
-            <option value="hold_ping" ${binding.messageType === "hold_ping" ? "selected" : ""}>Hold ping</option>
-          </select>
+          <label>Набор, сек<input name="typingSeconds" type="number" min="3" max="30" value="${binding.typingSeconds || 5}"></label>
         </div>
-        <div class="cell-stack">
-          <input name="typingSeconds" type="number" min="8" value="${binding.typingSeconds}" title="Время набора">
-          <input name="replyDelaySeconds" type="number" min="60" value="${binding.replyDelaySeconds}" title="Минимальное время ответа">
-          <input name="repeatIntervalMinutes" type="number" min="60" value="${binding.repeatIntervalMinutes}" title="Повтор, минут">
-        </div>
-        <div class="cell-stack">
-          <textarea name="scriptNote" rows="2" placeholder="Общий prompt / алгоритм">${binding.scriptNote || ""}</textarea>
-          <textarea name="persona" rows="2" placeholder="Роль оператора / тональность">${binding.persona || ""}</textarea>
-          <textarea name="delayedMessage" rows="2" placeholder="Отложенное сообщение">${binding.delayedMessage || ""}</textarea>
-          <textarea name="queueFallback" rows="2" placeholder="Сообщение при задержке / очереди">${binding.queueFallback || ""}</textarea>
-        </div>
-        <div class="script-actions">
-          <label class="checkline"><input type="checkbox" name="exclusiveScript" value="true" checked> без конфликта</label>
-          <button type="submit">Сохранить</button>
-        </div>
+        <textarea name="promptText" rows="4" placeholder="Один общий prompt для аккаунта">${escapeHtml(binding.promptText || "")}</textarea>
+        <button type="submit">Сохранить</button>
       </form>
     `).join("")}
   `;
+
+  table.querySelectorAll(".skill-select").forEach((select) => {
+    select.addEventListener("change", () => {
+      const timer = select.closest("form").querySelector(".timer-select");
+      timer.innerHTML = timerRows(select.value, "");
+    });
+  });
 
   table.querySelectorAll(".account-settings-form").forEach((form) => {
     form.addEventListener("submit", async (event) => {
@@ -219,16 +223,17 @@ function renderAccountScriptTable() {
 
 function renderCrmMatrix() {
   const matrix = document.getElementById("crmMatrix");
+  const accounts = crmFilter === "all" ? snapshot.accounts : snapshot.accounts.filter((account) => account.id === crmFilter);
   const header = ["Account ID", ...snapshot.stages.map((stage) => stage.title)];
-  const rows = snapshot.accounts.map((account) => {
+  const rows = accounts.map((account) => {
     const cells = snapshot.stages.map((stage) => {
       const leads = snapshot.leads.filter((lead) => lead.accountId === account.id && lead.stageId === stage.id);
       if (!leads.length) return `<div class="crm-cell muted-cell">-</div>`;
       return `
         <div class="crm-cell">
           ${leads.map((lead) => `
-            <button class="lead-chip ${stage.id === "stage-hold" ? "hold-chip" : ""}" type="button" data-lead-id="${lead.id}" title="${lead.status} Комментарий: ${lead.comment || "нет"}">
-              ${lead.telegram}
+            <button class="lead-chip ${stage.id === "stage-hold" ? "hold-chip" : ""}" type="button" data-lead-id="${lead.id}" title="${escapeHtml(lead.status)} Комментарий: ${escapeHtml(lead.comment || "нет")}">
+              ${escapeHtml(lead.telegram)}
               ${lead.nextPingAt ? `<small>ping: ${new Date(lead.nextPingAt).toLocaleDateString("ru-RU")}</small>` : ""}
             </button>
           `).join("")}
@@ -239,7 +244,7 @@ function renderCrmMatrix() {
       <div class="matrix-row">
         <div class="account-cell">
           <strong>${account.id}</strong>
-          <small>${account.name}</small>
+          <small>${escapeHtml(account.name)}</small>
         </div>
         ${cells}
       </div>
@@ -249,9 +254,9 @@ function renderCrmMatrix() {
   matrix.style.setProperty("--stage-count", snapshot.stages.length);
   matrix.innerHTML = `
     <div class="matrix-row header">
-      ${header.map((title) => `<div>${title}</div>`).join("")}
+      ${header.map((title) => `<div>${escapeHtml(title)}</div>`).join("")}
     </div>
-    ${rows}
+    ${rows || `<div class="empty-state">По выбранному аккаунту сделок нет.</div>`}
   `;
 
   matrix.querySelectorAll(".lead-chip").forEach((chip) => {
@@ -268,60 +273,81 @@ function renderCrmMatrix() {
   });
 }
 
-async function submitJson(form, path, messageId) {
-  const message = document.getElementById(messageId);
-  message.textContent = "Сохранение...";
-  message.classList.remove("error");
-
-  try {
-    await api(path, {
-      method: "POST",
-      body: JSON.stringify(formPayload(form))
-    });
-    message.textContent = "Сохранено и проверено backend.";
-    await refresh();
-  } catch (error) {
-    message.textContent = error.message;
-    message.classList.add("error");
-  }
-}
-
 function renderAll() {
   renderOptions();
   renderMetrics();
   renderAnalyticsTable();
-  renderClients();
-  renderAccountScriptTable();
+  renderAccountSettingsTable();
   renderCrmMatrix();
-  renderTelegramStatus();
 }
 
 async function refresh() {
   snapshot = await api("/api/snapshot");
-  document.getElementById("backendStatus").textContent = "backend: online";
   renderAll();
 }
 
-document.getElementById("promptForm").addEventListener("submit", (event) => {
-  event.preventDefault();
-  submitJson(event.currentTarget, "/api/prompts", "promptMessage");
+document.getElementById("crmAccountFilter").addEventListener("change", (event) => {
+  crmFilter = event.currentTarget.value;
+  renderCrmMatrix();
 });
 
-document.getElementById("importForm").addEventListener("submit", (event) => {
-  event.preventDefault();
-  submitJson(event.currentTarget, "/api/imports", "importMessage");
+document.getElementById("modalSkill").addEventListener("change", (event) => {
+  document.getElementById("modalTimer").innerHTML = timerRows(event.currentTarget.value, "");
 });
 
-document.getElementById("contactFile").addEventListener("change", async (event) => {
+document.getElementById("openAccountModal").addEventListener("click", () => {
+  document.getElementById("accountForm").reset();
+  document.getElementById("modalSkill").innerHTML = optionList(skills, "first_contact");
+  document.getElementById("modalTimer").innerHTML = timerRows("first_contact", "wait_60s");
+  accountModal.hidden = false;
+});
+
+document.getElementById("closeAccountModal").addEventListener("click", () => {
+  accountModal.hidden = true;
+});
+
+accountModal.addEventListener("click", (event) => {
+  if (event.target === accountModal) accountModal.hidden = true;
+});
+
+document.getElementById("modalContactFile").addEventListener("change", async (event) => {
   const file = event.currentTarget.files[0];
   if (!file) return;
-  const form = document.getElementById("importForm");
+  const form = document.getElementById("accountForm");
   form.elements.filename.value = file.name;
   if (/\.(txt|csv)$/i.test(file.name)) {
     form.elements.contacts.value = await file.text();
   } else {
     form.elements.contacts.value = "";
-    document.getElementById("importMessage").textContent = "Excel-файл выбран. Для полноценного парсинга на сервере нужен XLSX-парсер; сейчас будет сохранено имя базы.";
+    document.getElementById("accountMessage").textContent = "Excel-файл выбран. Для разбора XLSX нужен серверный парсер; сейчас будет сохранено имя базы.";
+  }
+});
+
+document.getElementById("accountForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const message = document.getElementById("accountMessage");
+  message.textContent = "Сохранение аккаунта...";
+  message.classList.remove("error");
+  try {
+    const payload = formPayload(form);
+    if (payload.contacts || payload.filename) {
+      const imported = await api("/api/imports", {
+        method: "POST",
+        body: JSON.stringify({ filename: payload.filename, contacts: payload.contacts })
+      });
+      payload.databaseId = imported.import.id;
+    }
+    await api("/api/accounts", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    message.textContent = "Аккаунт добавлен.";
+    accountModal.hidden = true;
+    await refresh();
+  } catch (error) {
+    message.textContent = error.message;
+    message.classList.add("error");
   }
 });
 
@@ -340,22 +366,14 @@ document.getElementById("summaryForm").addEventListener("submit", async (event) 
   }
 });
 
-document.getElementById("clientForm").addEventListener("submit", (event) => {
-  event.preventDefault();
-  submitJson(event.currentTarget, "/api/clients", "clientMessage");
-});
-
-document.getElementById("setWebhookButton").addEventListener("click", async () => {
-  const message = document.getElementById("telegramMessage");
-  message.textContent = "Подключение webhook...";
-  message.classList.remove("error");
+document.getElementById("holdSummaryButton").addEventListener("click", async () => {
+  const output = document.getElementById("holdSummaryOutput");
+  output.textContent = "Формирую summary по Hold...";
   try {
-    const payload = await api("/api/telegram/set-webhook", { method: "POST", body: "{}" });
-    message.textContent = `Webhook готов: ${payload.webhookUrl}`;
-    await renderTelegramStatus();
+    const payload = await api("/api/ai/hold-summary", { method: "POST", body: "{}" });
+    output.textContent = payload.summary;
   } catch (error) {
-    message.textContent = error.message;
-    message.classList.add("error");
+    output.textContent = error.message;
   }
 });
 
@@ -364,11 +382,11 @@ async function authSubmit(form, path) {
   message.textContent = "Проверка...";
   message.classList.remove("error");
   try {
-    const payload = await api(path, {
+    await api(path, {
       method: "POST",
       body: JSON.stringify(formPayload(form))
     });
-    setAuthed(payload.user);
+    setAuthed();
     await refresh();
   } catch (error) {
     message.textContent = error.message;
@@ -395,7 +413,7 @@ document.getElementById("logoutButton").addEventListener("click", async () => {
 api("/api/session")
   .then(async (payload) => {
     if (payload.authenticated) {
-      setAuthed(payload.user);
+      setAuthed();
       await refresh();
     }
   })

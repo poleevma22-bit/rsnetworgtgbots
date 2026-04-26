@@ -21,17 +21,13 @@ export const store = {
       status: "connected",
       health: "ok",
       connector: "Telegram API app",
-      promptId: "prompt-1",
       databaseId: "db-1",
-      scriptNote: "Работать только по opt-in контактам. Квалифицировать бюджет, срок и роль, затем передавать менеджеру.",
+      promptText: "Работать по разрешенной базе контактов. Квалифицировать бюджет, срок, роль собеседника и следующий шаг. Если сценария не хватает, переводить сделку в Hold и запрашивать summary у главного AI.",
       salesSkill: "qualification",
-      messageType: "reply",
-      repeatIntervalMinutes: 1440,
-      delayedMessage: "Спасибо, взял паузу на проверку деталей. Вернусь с ответом в ближайшее рабочее окно.",
-      queueFallback: "Заявка в очереди. Сейчас приоритет стандартный, вернемся с обновлением после обработки.",
-      persona: "Спокойный менеджер по работе с клиентами: кратко, делово, без обещаний вне регламента.",
-      replyDelaySeconds: 90,
-      typingSeconds: 14,
+      timerProfile: "wait_60s",
+      repeatIntervalMinutes: null,
+      replyDelaySeconds: 60,
+      typingSeconds: 5,
       workingHoursPerDay: 6,
       messagesSent: 148
     },
@@ -43,48 +39,25 @@ export const store = {
       status: "review",
       health: "limited",
       connector: "Bot API",
-      promptId: "prompt-2",
       databaseId: "db-1",
-      scriptNote: "Сценарий поддержки партнеров: уточнить контекст, зафиксировать требования и поднять приоритет для SLA-вопросов.",
-      salesSkill: "objection_handling",
-      messageType: "queue_update",
-      repeatIntervalMinutes: 43200,
-      delayedMessage: "Нужно немного больше времени на проверку. Зафиксировал вопрос и вернусь с обновлением.",
-      queueFallback: "Запрос в очереди партнерской поддержки. Текущий приоритет: SLA-вопрос.",
-      persona: "Аккуратный партнерский менеджер: уточняет ограничения, фиксирует требования, не давит.",
-      replyDelaySeconds: 180,
-      typingSeconds: 18,
+      promptText: "Поддерживать партнерский пресейл: уточнять контекст, фиксировать требования, не давить, SLA-вопросы поднимать в приоритет. При задержке писать короткий статус без обещаний вне регламента.",
+      salesSkill: "queue_reaction",
+      timerProfile: "wait_5m",
+      repeatIntervalMinutes: null,
+      replyDelaySeconds: 300,
+      typingSeconds: 5,
       workingHoursPerDay: 5,
       messagesSent: 42
     }
   ],
-  prompts: [
-    {
-      id: "prompt-1",
-      title: "B2B квалификация",
-      businessCase: "Квалифицировать входящие заявки по бюджету, срокам и роли собеседника.",
-      messageTemplates: [
-        "Здравствуйте. Подскажите, какая задача сейчас приоритетна для команды?",
-        "Правильно понимаю, что ключевой критерий - скорость внедрения?"
-      ],
-      priorityRules: "Сначала отвечать на горячие лиды с бюджетом и сроком до 30 дней."
-    },
-    {
-      id: "prompt-2",
-      title: "Партнерский пресейл",
-      businessCase: "Собрать контекст партнера и передать менеджеру только подтвержденные сделки.",
-      messageTemplates: [
-        "Спасибо за детали. Я зафиксирую требования и передам менеджеру.",
-        "Есть ли ограничения по интеграции или безопасности?"
-      ],
-      priorityRules: "VIP-партнеры, активные сделки и SLA-вопросы выше обычных обращений."
-    }
-  ],
+  prompts: [],
   stages: [
     { id: "stage-1", title: "Новый контакт", color: "#64748b" },
     { id: "stage-2", title: "Квалификация", color: "#0f766e" },
     { id: "stage-3", title: "Презентация", color: "#7c3aed" },
+    { id: "stage-offer", title: "Оффер отправлен", color: "#2563eb" },
     { id: "stage-4", title: "Согласование", color: "#b45309" },
+    { id: "stage-onboarding", title: "Онбординг", color: "#15803d" },
     { id: "stage-5", title: "Выиграно", color: "#15803d" },
     { id: "stage-hold", title: "Hold", color: "#71717a" },
     { id: "stage-archive", title: "Archive", color: "#525252" }
@@ -92,7 +65,7 @@ export const store = {
   databases: [
     {
       id: "db-1",
-      filename: "opt-in-demo.txt",
+      filename: "telegram-contacts-demo.txt",
       total: 320,
       valid: 304,
       rejected: 16,
@@ -119,7 +92,7 @@ export const store = {
       telegram: "@founder_north",
       accountId: "tg-100317",
       stageId: "stage-1",
-      status: "Ожидает первого ответа после opt-in формы.",
+      status: "Ожидает первого ответа после формы.",
       comment: "Проверить источник заявки до ответа.",
       lastReplyAt: null,
       messages: []
@@ -128,9 +101,9 @@ export const store = {
       id: "lead-3",
       telegram: "@procurement_team",
       accountId: "tg-100241",
-      stageId: "stage-4",
-      status: "Согласуют договор и DPA.",
-      comment: "Юрист запросил SLA и DPA.",
+      stageId: "stage-offer",
+      status: "Оффер отправлен, ждут DPA и SLA.",
+      comment: "Юрист запросил DPA и условия поддержки.",
       lastReplyAt: "2026-04-24T06:15:00.000Z",
       messages: [
         { direction: "in", text: "Пришлите DPA и условия поддержки." },
@@ -150,6 +123,19 @@ export const store = {
         { direction: "in", text: "Вернемся к обсуждению через месяц." },
         { direction: "out", text: "Зафиксировал. Напомню о статусе проекта в следующем месяце." }
       ]
+    },
+    {
+      id: "lead-5",
+      telegram: "@new_ops_team",
+      accountId: "tg-100241",
+      stageId: "stage-onboarding",
+      status: "Онбординг: согласован старт и список доступов.",
+      comment: "Проверить готовность аккаунтов и интеграций.",
+      lastReplyAt: "2026-04-25T10:00:00.000Z",
+      messages: [
+        { direction: "in", text: "Готовы начать, пришлем доступы." },
+        { direction: "out", text: "Принял. Зафиксирую старт и список доступов." }
+      ]
     }
   ]
 };
@@ -157,7 +143,6 @@ export const store = {
 export function getSnapshot() {
   const accountMap = Object.fromEntries(store.accounts.map((account) => [account.id, account]));
   const stageMap = Object.fromEntries(store.stages.map((stage) => [stage.id, stage]));
-  const promptMap = Object.fromEntries(store.prompts.map((prompt) => [prompt.id, prompt]));
   const databaseMap = Object.fromEntries(store.databases.map((database) => [database.id, database]));
 
   const leads = store.leads.map((lead) => ({
@@ -170,21 +155,20 @@ export function getSnapshot() {
   const bindings = store.accounts.map((account) => ({
     accountId: account.id,
     accountName: account.name,
-    promptId: account.promptId,
     databaseId: account.databaseId,
-    scriptNote: account.scriptNote || "",
-    salesSkill: account.salesSkill || "qualification",
-    messageType: account.messageType || "reply",
-    repeatIntervalMinutes: account.repeatIntervalMinutes ?? 1440,
-    delayedMessage: account.delayedMessage || "",
-    queueFallback: account.queueFallback || "",
-    persona: account.persona || "",
+    database: databaseMap[account.databaseId]?.filename ?? "База не загружена",
+    salesSkill: account.salesSkill || "first_contact",
+    timerProfile: account.timerProfile || "wait_60s",
+    promptText: account.promptText || account.scriptNote || "",
+    repeatIntervalMinutes: account.repeatIntervalMinutes ?? null,
     replyDelaySeconds: account.replyDelaySeconds,
-    typingSeconds: account.typingSeconds,
-    prompt: promptMap[account.promptId]?.title ?? "Промпт не выбран",
-    database: databaseMap[account.databaseId]?.filename ?? "База не выбрана",
+    typingSeconds: account.typingSeconds ?? 5,
     timer: `${account.replyDelaySeconds} сек / набор ${account.typingSeconds} сек`
   }));
+
+  const hold = store.leads.filter((lead) => lead.stageId === "stage-hold").length;
+  const offer = store.leads.filter((lead) => lead.stageId === "stage-offer").length;
+  const onboarding = store.leads.filter((lead) => lead.stageId === "stage-onboarding").length;
 
   return {
     accounts: store.accounts,
@@ -200,7 +184,9 @@ export function getSnapshot() {
       contactsUsed: store.leads.length,
       answered: store.leads.filter((lead) => lead.lastReplyAt).length,
       ignored: store.leads.filter((lead) => !lead.lastReplyAt).length,
-      hold: store.leads.filter((lead) => lead.stageId === "stage-hold").length,
+      hold,
+      offer,
+      onboarding,
       archived: store.leads.filter((lead) => lead.stageId === "stage-archive").length,
       accountsInWork: store.accounts.length,
       connectedAccounts: store.accounts.filter((account) => account.status === "connected").length,
