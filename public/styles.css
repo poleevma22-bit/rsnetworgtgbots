@@ -311,6 +311,16 @@ body:has(.sidebar.collapsed) {
   cursor: pointer;
 }
 
+.secondary-button {
+  width: fit-content;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 11px 14px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
 .eyebrow {
   margin: 0 0 7px;
   color: var(--muted);
@@ -437,6 +447,31 @@ label,
 
 .wide-field {
   grid-column: 1 / -1;
+}
+
+.api-box {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.api-box div {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px;
+  background: var(--surface-soft);
+}
+
+.api-box strong,
+.api-box span {
+  display: block;
+}
+
+.api-box span {
+  margin-top: 6px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .account-script-table {
@@ -692,7 +727,8 @@ button[type="submit"]:hover {
   .settings-grid,
   .metric-grid,
   .compact-grid,
-  .compact-grid.two {
+  .compact-grid.two,
+  .api-box {
     grid-template-columns: 1fr 1fr;
   }
 }
@@ -740,7 +776,8 @@ button[type="submit"]:hover {
   .metric-grid,
   .inline-fields,
   .compact-grid,
-  .compact-grid.two {
+  .compact-grid.two,
+  .api-box {
     grid-template-columns: 1fr;
     display: grid;
   }

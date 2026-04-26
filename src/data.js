@@ -1,6 +1,17 @@
 import { summarizeDialog } from "./safety.js";
 
 export const store = {
+  clients: [
+    {
+      id: "client-rs-network",
+      name: "RS Network",
+      brand: "RS Network",
+      status: "active",
+      ownerEmail: "admin@rs.local",
+      createdAt: "2026-04-26T00:00:00.000Z"
+    }
+  ],
+  telegramUpdates: [],
   accounts: [
     {
       id: "tg-100241",
@@ -177,6 +188,8 @@ export function getSnapshot() {
 
   return {
     accounts: store.accounts,
+    clients: store.clients,
+    telegramUpdates: store.telegramUpdates.slice(-20),
     prompts: store.prompts,
     stages: store.stages,
     databases: store.databases,
@@ -192,6 +205,7 @@ export function getSnapshot() {
       accountsInWork: store.accounts.length,
       connectedAccounts: store.accounts.filter((account) => account.status === "connected").length,
       messagesSent: store.accounts.reduce((sum, account) => sum + account.messagesSent, 0),
+      telegramUpdates: store.telegramUpdates.length,
       nextRefresh: "каждые 3 часа"
     }
   };

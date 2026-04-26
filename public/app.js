@@ -99,6 +99,40 @@ function renderAnalyticsTable() {
   `;
 }
 
+function renderClients() {
+  const table = document.getElementById("clientTable");
+  if (!table) return;
+  table.innerHTML = `
+    <div class="row header"><span>ID</span><span>Клиент</span><span>Бренд</span><span>Владелец</span><span>Статус</span></div>
+    ${snapshot.clients.map((client) => `
+      <div class="row">
+        <span>${client.id}</span>
+        <span>${client.name}</span>
+        <span>${client.brand}</span>
+        <span>${client.ownerEmail || "-"}</span>
+        <span>${client.status}</span>
+      </div>
+    `).join("")}
+  `;
+}
+
+async function renderTelegramStatus() {
+  const box = document.getElementById("telegramStatus");
+  if (!box) return;
+  try {
+    const payload = await api("/api/telegram/status");
+    const tg = payload.telegram;
+    box.innerHTML = `
+      <div><strong>Webhook path</strong><span>${tg.webhookPath}</span></div>
+      <div><strong>Bot token</strong><span>${tg.configured ? "configured" : "not configured"}</span></div>
+      <div><strong>Public URL</strong><span>${tg.publicWebhookUrl || "not configured"}</span></div>
+      <div><strong>Secret</strong><span>${tg.hasSecret ? "configured" : "not configured"}</span></div>
+    `;
+  } catch (error) {
+    box.textContent = error.message;
+  }
+}
+
 function renderAccountScriptTable() {
   const table = document.getElementById("accountScriptTable");
   if (!snapshot.accounts.length) {
@@ -256,8 +290,10 @@ function renderAll() {
   renderOptions();
   renderMetrics();
   renderAnalyticsTable();
+  renderClients();
   renderAccountScriptTable();
   renderCrmMatrix();
+  renderTelegramStatus();
 }
 
 async function refresh() {
@@ -301,6 +337,25 @@ document.getElementById("summaryForm").addEventListener("submit", async (event) 
     output.textContent = payload.summary;
   } catch (error) {
     output.textContent = error.message;
+  }
+});
+
+document.getElementById("clientForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitJson(event.currentTarget, "/api/clients", "clientMessage");
+});
+
+document.getElementById("setWebhookButton").addEventListener("click", async () => {
+  const message = document.getElementById("telegramMessage");
+  message.textContent = "Подключение webhook...";
+  message.classList.remove("error");
+  try {
+    const payload = await api("/api/telegram/set-webhook", { method: "POST", body: "{}" });
+    message.textContent = `Webhook готов: ${payload.webhookUrl}`;
+    await renderTelegramStatus();
+  } catch (error) {
+    message.textContent = error.message;
+    message.classList.add("error");
   }
 });
 

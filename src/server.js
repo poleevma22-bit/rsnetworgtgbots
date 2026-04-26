@@ -24,6 +24,10 @@ const contentTypes = {
 };
 
 const sessions = new Map();
+const demoAdmin = {
+  email: "admin@rs.local",
+  password: "admin12345"
+};
 
 function sendJson(response, status, payload) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -82,6 +86,30 @@ function verifyPassword(password, stored) {
   return candidate.length === expected.length && timingSafeEqual(candidate, expected);
 }
 
+async function ensureDemoAdmin() {
+  const users = await loadUsers();
+  if (users.some((user) => user.email === demoAdmin.email)) return users;
+  users.push({
+    id: "user-demo-admin",
+    email: demoAdmin.email,
+    passwordHash: hashPassword(demoAdmin.password),
+    role: "admin",
+    clientId: "client-rs-network",
+    createdAt: new Date().toISOString()
+  });
+  await saveUsers(users);
+  return users;
+}
+
+function telegramConfig() {
+  return {
+    configured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
+    publicWebhookUrl: process.env.PUBLIC_WEBHOOK_URL || "",
+    hasSecret: Boolean(process.env.TELEGRAM_WEBHOOK_SECRET),
+    webhookPath: "/api/telegram/webhook"
+  };
+}
+
 async function readBody(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
@@ -135,7 +163,7 @@ async function handleApi(request, response) {
   if (request.method === "POST" && url.pathname === "/api/login") {
     const body = await readBody(request);
     const email = String(body.email || "").trim().toLowerCase();
-    const users = await loadUsers();
+    const users = await ensureDemoAdmin();
     const user = users.find((item) => item.email === email);
     if (!user || !verifyPassword(String(body.password || ""), user.passwordHash)) {
       sendJson(response, 401, { ok: false, error: "Неверный email или пароль." });
@@ -157,8 +185,78 @@ async function handleApi(request, response) {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/api/telegram/webhook") {
+    const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    if (expectedSecret && request.headers["x-telegram-bot-api-secret-token"] !== expectedSecret) {
+      sendJson(response, 403, { ok: false, error: "Invalid Telegram webhook secret" });
+      return;
+    }
+    const update = await readBody(request);
+    store.telegramUpdates.push({
+      id: `tg-update-${Date.now()}`,
+      updateId: update.update_id,
+      chatId: update.message?.chat?.id,
+      username: update.message?.from?.username ? `@${update.message.from.username}` : "",
+      text: update.message?.text || "",
+      receivedAt: new Date().toISOString()
+    });
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
   if (!getSessionUser(request)) {
     sendJson(response, 401, { ok: false, error: "Требуется вход" });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/clients") {
+    sendJson(response, 200, { ok: true, clients: store.clients });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/clients") {
+    const body = await readBody(request);
+    const name = String(body.name || "").trim();
+    if (!name) {
+      sendJson(response, 422, { ok: false, error: "Укажите название клиента." });
+      return;
+    }
+    const client = {
+      id: `client-${Date.now()}`,
+      name,
+      brand: body.brand || name,
+      status: "active",
+      ownerEmail: body.ownerEmail || "",
+      createdAt: new Date().toISOString()
+    };
+    store.clients.push(client);
+    sendJson(response, 201, { ok: true, client });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/telegram/status") {
+    sendJson(response, 200, { ok: true, telegram: telegramConfig() });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/telegram/set-webhook") {
+    const config = telegramConfig();
+    if (!config.configured || !config.publicWebhookUrl) {
+      sendJson(response, 422, { ok: false, error: "Нужны TELEGRAM_BOT_TOKEN и PUBLIC_WEBHOOK_URL в env сервера." });
+      return;
+    }
+    const webhookUrl = `${config.publicWebhookUrl.replace(/\/$/, "")}${config.webhookPath}`;
+    const result = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        url: webhookUrl,
+        secret_token: process.env.TELEGRAM_WEBHOOK_SECRET || undefined,
+        allowed_updates: ["message"]
+      })
+    });
+    const payload = await result.json();
+    sendJson(response, result.ok ? 200 : 502, { ok: result.ok, telegram: payload, webhookUrl });
     return;
   }
 

@@ -54,6 +54,7 @@
       <nav class="nav">
         <button class="active" data-section="analytics" data-short="AN" title="Аналитика"><span>Аналитика</span></button>
         <button data-section="settings" data-short="SET" title="Настройки продаж"><span>Настройки продаж</span></button>
+        <button data-section="clients" data-short="CL" title="Клиенты"><span>Клиенты</span></button>
         <button data-section="crm" data-short="CRM" title="CRM"><span>CRM</span></button>
       </nav>
       <div class="policy">
@@ -153,6 +154,42 @@ t.me/founder_north</textarea></label>
           </div>
           <div id="crmMatrix" class="crm-matrix"></div>
         </article>
+      </section>
+
+      <section id="clients" class="section" data-title="Клиенты и Telegram Cloud Bot">
+        <div class="settings-stack">
+          <form id="clientForm" class="panel compact-form">
+            <div class="panel-head">
+              <h2>Добавить клиента</h2>
+              <span>отдельный бренд и контур управления</span>
+            </div>
+            <div class="compact-grid">
+              <label>Название клиента<input name="name" value="Demo Client" required></label>
+              <label>Бренд<input name="brand" value="Demo Client"></label>
+              <label>Email владельца<input name="ownerEmail" type="email" value="owner@example.com"></label>
+            </div>
+            <button type="submit">Создать клиента</button>
+            <p class="form-message" id="clientMessage"></p>
+          </form>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Клиенты</h2>
+              <span>бренды внутри системы</span>
+            </div>
+            <div id="clientTable" class="sales-table"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Telegram Cloud Bot API</h2>
+              <span>webhook endpoint для Bot API</span>
+            </div>
+            <div id="telegramStatus" class="api-box"></div>
+            <button id="setWebhookButton" type="button" class="secondary-button">Подключить webhook</button>
+            <p class="form-message" id="telegramMessage"></p>
+          </article>
+        </div>
       </section>
     </main>
 
