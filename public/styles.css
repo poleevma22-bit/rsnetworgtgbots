@@ -51,6 +51,10 @@ body.auth-locked .app {
     #000;
 }
 
+.auth-screen[hidden] {
+  display: none !important;
+}
+
 .landing-logo {
   width: min(280px, 36vw);
   height: auto;
@@ -72,27 +76,18 @@ body.auth-locked .app {
   line-height: 1.55;
 }
 
-.landing-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 28px;
-}
-
-.landing-stats span {
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 9px 13px;
-  color: var(--text);
-  background: var(--surface);
-}
-
 .auth-card {
   border: 1px solid var(--line);
   border-radius: 28px;
   padding: 24px;
   background: var(--surface);
   box-shadow: var(--shadow);
+}
+
+.demo-access {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .auth-tabs {
@@ -200,14 +195,11 @@ textarea {
 }
 
 .brand-copy strong,
-.brand-copy span,
-.policy strong,
-.policy small {
+.brand-copy span {
   display: block;
 }
 
-.brand-copy span,
-.policy small {
+.brand-copy span {
   color: var(--muted);
   font-size: 12px;
   margin-top: 3px;
@@ -232,6 +224,9 @@ textarea {
   border-radius: 999px;
   cursor: pointer;
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   transition: background 0.16s ease, color 0.16s ease;
 }
 
@@ -241,12 +236,56 @@ textarea {
   color: var(--text);
 }
 
-.policy {
+.nav-note {
   margin-top: auto;
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 14px;
-  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 0 10px 4px;
+}
+
+.nav-icon {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  display: grid;
+  place-items: center;
+  color: currentColor;
+  font-weight: 800;
+}
+
+.nav button[data-icon="analytics"] .nav-icon::before {
+  content: "";
+  width: 16px;
+  height: 14px;
+  background:
+    linear-gradient(currentColor 0 0) 1px 8px / 3px 6px no-repeat,
+    linear-gradient(currentColor 0 0) 7px 4px / 3px 10px no-repeat,
+    linear-gradient(currentColor 0 0) 13px 1px / 3px 13px no-repeat;
+}
+
+.nav button[data-icon="sales"] .nav-icon::before {
+  content: "$";
+  font-size: 18px;
+  line-height: 1;
+}
+
+.nav button[data-icon="clients"] .nav-icon::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: -6px 7px 0 currentColor, 6px 7px 0 currentColor;
+}
+
+.nav button[data-icon="crm"] .nav-icon::before {
+  content: "";
+  width: 17px;
+  height: 11px;
+  border-left: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  background: linear-gradient(135deg, transparent 43%, currentColor 44% 55%, transparent 56%);
 }
 
 .sidebar.collapsed {
@@ -261,7 +300,7 @@ body:has(.sidebar.collapsed) {
 
 .sidebar.collapsed .brand-copy,
 .sidebar.collapsed .nav span,
-.sidebar.collapsed .policy {
+.sidebar.collapsed .nav-note {
   display: none;
 }
 
@@ -270,14 +309,7 @@ body:has(.sidebar.collapsed) {
   min-height: 42px;
   padding: 0;
   border-radius: 50%;
-}
-
-.sidebar.collapsed .nav button::before {
-  content: attr(data-short);
-  display: block;
-  font-size: 11px;
-  line-height: 42px;
-  letter-spacing: 0.02em;
+  justify-content: center;
 }
 
 .app {
@@ -757,7 +789,7 @@ button[type="submit"]:hover {
     padding-right: 10px;
   }
 
-  .sidebar:not(.collapsed) .policy {
+  .sidebar:not(.collapsed) .nav-note {
     display: none;
   }
 

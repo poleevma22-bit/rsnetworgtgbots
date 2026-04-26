@@ -88,7 +88,14 @@ function verifyPassword(password, stored) {
 
 async function ensureDemoAdmin() {
   const users = await loadUsers();
-  if (users.some((user) => user.email === demoAdmin.email)) return users;
+  const existing = users.find((user) => user.email === demoAdmin.email);
+  if (existing) {
+    existing.passwordHash = hashPassword(demoAdmin.password);
+    existing.role = "admin";
+    existing.clientId = "client-rs-network";
+    await saveUsers(users);
+    return users;
+  }
   users.push({
     id: "user-demo-admin",
     email: demoAdmin.email,
