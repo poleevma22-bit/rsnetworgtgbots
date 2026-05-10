@@ -1,3 +1,4 @@
+import "dotenv/config";
 import http from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
@@ -6,12 +7,24 @@ import { fileURLToPath } from "node:url";
 import xlsx from "xlsx";
 import { store, getSnapshot } from "./data.js";
 import { validateAutomationPolicy } from "./safety.js";
+import {
+  insertDatabase, updateAccountSettings, updateLeadComment,
+  listAccounts, getAccount
+} from "./db.js";
+import {
+  connectBot, disconnectBot, getWebhookInfo, handleIncomingUpdate,
+  syncAllWebhooks, BotApiError
+} from "./telegram-bot.js";
+import {
+  startAuth, confirmAuth, disconnectMtproto, bootAllWorkers, MtprotoError
+} from "./telegram-mtproto.js";
 
 const root = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
 const publicDir = join(root, "public");
 const dataDir = join(root, "data");
 const usersPath = join(dataDir, "users.json");
 const port = Number(process.env.PORT || 4173);
+const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -84,11 +97,12 @@ function resolveTimerProfile(timerProfile = "wait_60s") {
 }
 
 function buildHoldSummary() {
-  const holds = store.leads.filter((lead) => lead.stageId === "stage-hold");
+  const snap = getSnapshot();
+  const holds = snap.leads.filter((lead) => lead.stageId === "stage-hold");
   if (!holds.length) return "Hold пустой: зависших сделок сейчас нет.";
   return holds
     .map((lead) => {
-      const account = store.accounts.find((item) => item.id === lead.accountId);
+      const account = snap.accounts.find((item) => item.id === lead.accountId);
       const nextPing = lead.nextPingAt ? new Date(lead.nextPingAt).toLocaleDateString("ru-RU") : "пинг не назначен";
       return `${lead.telegram} / ${account?.id || "без аккаунта"}: ${lead.status} Следующий пинг: ${nextPing}. Комментарий: ${lead.comment || "нет"}.`;
     })
@@ -174,11 +188,14 @@ async function ensureDemoAdmin() {
 }
 
 function telegramConfig() {
+  const accounts = listAccounts();
   return {
-    configured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
-    publicWebhookUrl: process.env.PUBLIC_WEBHOOK_URL || "",
-    hasSecret: Boolean(process.env.TELEGRAM_WEBHOOK_SECRET),
-    webhookPath: "/api/telegram/webhook"
+    configured: accounts.length > 0,
+    botApiCount: accounts.filter((a) => a.connector === "Bot API").length,
+    mtprotoCount: accounts.filter((a) => a.connector === "Telegram API app").length,
+    publicBaseUrl,
+    webhookPath: "/api/telegram/webhook/:botId",
+    hasMtprotoCreds: Boolean(process.env.TG_API_ID && process.env.TG_API_HASH)
   };
 }
 
@@ -186,13 +203,21 @@ async function readBody(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
   if (!chunks.length) return {};
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { return {}; }
+}
+
+function reportError(response, error) {
+  const status = error?.status || 500;
+  sendJson(response, status, { ok: false, error: error?.message || "Internal error", code: error?.code });
 }
 
 async function handleApi(request, response) {
   const url = new URL(request.url, `http://${request.headers.host}`);
+  const path = url.pathname;
 
-  if (request.method === "GET" && url.pathname === "/api/snapshot") {
+  // --- Public: snapshot/session/auth ---
+  if (request.method === "GET" && path === "/api/snapshot") {
     if (!getSessionUser(request)) {
       sendJson(response, 401, { ok: false, error: "Требуется вход" });
       return;
@@ -201,13 +226,13 @@ async function handleApi(request, response) {
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/api/session") {
+  if (request.method === "GET" && path === "/api/session") {
     const user = getSessionUser(request);
     sendJson(response, 200, { ok: true, authenticated: Boolean(user), user });
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/register") {
+  if (request.method === "POST" && path === "/api/register") {
     const body = await readBody(request);
     const email = String(body.email || "").trim().toLowerCase();
     const password = String(body.password || "");
@@ -215,13 +240,11 @@ async function handleApi(request, response) {
       sendJson(response, 422, { ok: false, error: "Укажите email и пароль от 8 символов." });
       return;
     }
-
     const users = await loadUsers();
     if (users.some((user) => user.email === email)) {
       sendJson(response, 409, { ok: false, error: "Пользователь уже существует." });
       return;
     }
-
     const user = { id: `user-${Date.now()}`, email, passwordHash: hashPassword(password), createdAt: new Date().toISOString() };
     users.push(user);
     await saveUsers(users);
@@ -232,7 +255,7 @@ async function handleApi(request, response) {
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/login") {
+  if (request.method === "POST" && path === "/api/login") {
     const body = await readBody(request);
     const email = String(body.email || "").trim().toLowerCase();
     const users = await ensureDemoAdmin();
@@ -241,7 +264,6 @@ async function handleApi(request, response) {
       sendJson(response, 401, { ok: false, error: "Неверный email или пароль." });
       return;
     }
-
     const token = randomBytes(32).toString("hex");
     sessions.set(token, { id: user.id, email: user.email, role: user.role || "user" });
     response.setHeader("Set-Cookie", `rs_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`);
@@ -249,7 +271,7 @@ async function handleApi(request, response) {
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/logout") {
+  if (request.method === "POST" && path === "/api/logout") {
     const token = parseCookies(request.headers.cookie || "").rs_session;
     if (token) sessions.delete(token);
     response.setHeader("Set-Cookie", "rs_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
@@ -257,42 +279,36 @@ async function handleApi(request, response) {
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/telegram/webhook") {
-    const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
-    if (expectedSecret && request.headers["x-telegram-bot-api-secret-token"] !== expectedSecret) {
-      sendJson(response, 403, { ok: false, error: "Invalid Telegram webhook secret" });
-      return;
-    }
+  // --- Bot API webhook (PUBLIC: must work without session) ---
+  // /api/telegram/webhook/:botId
+  if (request.method === "POST" && path.startsWith("/api/telegram/webhook/")) {
+    const botId = path.slice("/api/telegram/webhook/".length).split("/")[0];
+    const secret = request.headers["x-telegram-bot-api-secret-token"] || "";
     const update = await readBody(request);
-    store.telegramUpdates.push({
-      id: `tg-update-${Date.now()}`,
-      updateId: update.update_id,
-      chatId: update.message?.chat?.id,
-      username: update.message?.from?.username ? `@${update.message.from.username}` : "",
-      text: update.message?.text || "",
-      receivedAt: new Date().toISOString()
-    });
-    sendJson(response, 200, { ok: true });
+    try {
+      handleIncomingUpdate(botId, secret, update);
+      sendJson(response, 200, { ok: true });
+    } catch (e) {
+      reportError(response, e);
+    }
     return;
   }
 
+  // --- Auth-required below ---
   if (!getSessionUser(request)) {
     sendJson(response, 401, { ok: false, error: "Требуется вход" });
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/api/clients") {
+  if (request.method === "GET" && path === "/api/clients") {
     sendJson(response, 200, { ok: true, clients: store.clients });
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/clients") {
+  if (request.method === "POST" && path === "/api/clients") {
     const body = await readBody(request);
     const name = String(body.name || "").trim();
-    if (!name) {
-      sendJson(response, 422, { ok: false, error: "Укажите название клиента." });
-      return;
-    }
+    if (!name) { sendJson(response, 422, { ok: false, error: "Укажите название клиента." }); return; }
     const client = {
       id: `client-${Date.now()}`,
       name,
@@ -306,144 +322,94 @@ async function handleApi(request, response) {
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/api/telegram/status") {
+  // --- Telegram status & sync ---
+  if (request.method === "GET" && path === "/api/telegram/status") {
     sendJson(response, 200, { ok: true, telegram: telegramConfig() });
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/telegram/set-webhook") {
-    const config = telegramConfig();
-    if (!config.configured || !config.publicWebhookUrl) {
-      sendJson(response, 422, { ok: false, error: "Нужны TELEGRAM_BOT_TOKEN и PUBLIC_WEBHOOK_URL в env сервера." });
+  if (request.method === "POST" && path === "/api/telegram/sync-webhooks") {
+    if (!publicBaseUrl) {
+      sendJson(response, 422, { ok: false, error: "PUBLIC_BASE_URL не настроен в env сервиса" });
       return;
     }
-    const webhookUrl = `${config.publicWebhookUrl.replace(/\/$/, "")}${config.webhookPath}`;
-    const result = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        url: webhookUrl,
-        secret_token: process.env.TELEGRAM_WEBHOOK_SECRET || undefined,
-        allowed_updates: ["message"]
-      })
-    });
-    const payload = await result.json();
-    sendJson(response, result.ok ? 200 : 502, { ok: result.ok, telegram: payload, webhookUrl });
+    try {
+      const result = await syncAllWebhooks(publicBaseUrl);
+      sendJson(response, 200, { ok: true, results: result });
+    } catch (e) { reportError(response, e); }
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/accounts") {
+  // --- Bot API CRUD ---
+  if (request.method === "POST" && path === "/api/telegram/bots") {
     const body = await readBody(request);
-    const timer = resolveTimerProfile(body.timerProfile);
-    const policy = validateAutomationPolicy({
-      replyDelaySeconds: body.replyDelaySeconds || timer.replyDelaySeconds,
-      typingSeconds: 5,
-      workingHoursPerDay: body.workingHoursPerDay || 6,
-      outreachMode: "opt_in"
-    });
-    if (!policy.ok) {
-      sendJson(response, 422, { ok: false, errors: policy.errors });
-      return;
-    }
-
-    const account = {
-      id: body.id || `tg-${Date.now()}`,
-      name: body.name || body.id || "Telegram account",
-      handle: body.handle || "",
-      avatarUrl: body.avatarUrl || "",
-      status: "pending",
-      health: "review",
-      connector: body.connector || "Telegram API app",
-      databaseId: body.databaseId,
-      salesSkill: body.salesSkill || "first_contact",
-      timerProfile: body.timerProfile || "wait_60s",
-      promptText: body.promptText || "",
-      replyDelaySeconds: Number(body.replyDelaySeconds || timer.replyDelaySeconds),
-      repeatIntervalMinutes: timer.repeatIntervalMinutes,
-      typingSeconds: 5,
-      workingHoursPerDay: Number(body.workingHoursPerDay || 6),
-      messagesSent: 0
-    };
-
-    store.accounts.push(account);
-    sendJson(response, 201, { ok: true, account });
+    const token = String(body.token || "").trim();
+    try {
+      const result = await connectBot({ token, publicBaseUrl });
+      sendJson(response, 201, { ok: true, ...result });
+    } catch (e) { reportError(response, e); }
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/prompts") {
-    const body = await readBody(request);
-    const prompt = {
-      id: `prompt-${Date.now()}`,
-      title: body.title,
-      businessCase: body.businessCase,
-      messageTemplates: String(body.messageTemplates || "")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean),
-      priorityRules: body.priorityRules || ""
-    };
-    store.prompts.push(prompt);
-    sendJson(response, 201, { ok: true, prompt });
+  // GET /api/telegram/bots/:id/webhook-info
+  const wiMatch = path.match(/^\/api\/telegram\/bots\/([^/]+)\/webhook-info$/);
+  if (request.method === "GET" && wiMatch) {
+    try {
+      const info = await getWebhookInfo(wiMatch[1]);
+      sendJson(response, 200, { ok: true, info });
+    } catch (e) { reportError(response, e); }
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/stages") {
-    const body = await readBody(request);
-    const stage = { id: `stage-${Date.now()}`, title: body.title, color: body.color || "#334155" };
-    store.stages.push(stage);
-    sendJson(response, 201, { ok: true, stage });
+  // DELETE /api/telegram/bots/:id
+  const delMatch = path.match(/^\/api\/telegram\/bots\/([^/]+)$/);
+  if (request.method === "DELETE" && delMatch) {
+    try {
+      await disconnectBot(delMatch[1]);
+      sendJson(response, 200, { ok: true });
+    } catch (e) { reportError(response, e); }
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/imports") {
+  // --- MTProto ---
+  if (request.method === "POST" && path === "/api/telegram/mtproto/start") {
     const body = await readBody(request);
-    const contacts = parseTelegramContacts({
-      contacts: body.contacts || body.csv || "",
-      fileBase64: body.fileBase64 || "",
-      filename: body.filename || "telegram-contacts.txt"
-    });
-    const item = {
-      id: `db-${Date.now()}`,
-      filename: body.filename || "telegram-contacts.txt",
-      total: contacts.total,
-      valid: contacts.valid,
-      rejected: contacts.rejected,
-      sample: contacts.sample,
-      contacts: contacts.contacts,
-      createdAt: new Date().toISOString()
-    };
-    store.databases.push(item);
-    if (body.accountId) {
-      const account = store.accounts.find((entry) => entry.id === body.accountId);
-      if (account) account.databaseId = item.id;
-    }
-    sendJson(response, 201, { ok: true, import: item });
+    try {
+      const result = await startAuth({ phone: String(body.phone || "").trim() });
+      sendJson(response, 200, { ok: true, ...result });
+    } catch (e) { reportError(response, e); }
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/bindings") {
+  if (request.method === "POST" && path === "/api/telegram/mtproto/confirm") {
     const body = await readBody(request);
-    const account = store.accounts.find((item) => item.id === body.accountId);
-    if (!account) {
-      sendJson(response, 404, { ok: false, error: "Аккаунт не найден" });
-      return;
-    }
-
-    account.promptId = body.promptId;
-    account.databaseId = body.databaseId;
-    account.scriptNote = body.scriptNote || account.scriptNote || "";
-    sendJson(response, 200, { ok: true, account });
+    try {
+      const result = await confirmAuth({
+        tempId: String(body.tempId || ""),
+        code: String(body.code || ""),
+        password: body.password ? String(body.password) : undefined
+      });
+      sendJson(response, 200, { ok: true, ...result });
+    } catch (e) { reportError(response, e); }
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/account-settings") {
-    const body = await readBody(request);
-    const account = store.accounts.find((item) => item.id === body.accountId);
-    if (!account) {
-      sendJson(response, 404, { ok: false, error: "Аккаунт не найден" });
-      return;
-    }
+  // DELETE /api/telegram/mtproto/:id
+  const mtDelMatch = path.match(/^\/api\/telegram\/mtproto\/([^/]+)$/);
+  if (request.method === "DELETE" && mtDelMatch) {
+    try {
+      await disconnectMtproto(mtDelMatch[1]);
+      sendJson(response, 200, { ok: true });
+    } catch (e) { reportError(response, e); }
+    return;
+  }
 
+  // --- Existing endpoints (now backed by db where applicable) ---
+
+  if (request.method === "POST" && path === "/api/account-settings") {
+    const body = await readBody(request);
+    const account = getAccount(body.accountId);
+    if (!account) { sendJson(response, 404, { ok: false, error: "Аккаунт не найден" }); return; }
     const timer = resolveTimerProfile(body.timerProfile || account.timerProfile);
     const policy = validateAutomationPolicy({
       replyDelaySeconds: timer.replyDelaySeconds,
@@ -451,81 +417,88 @@ async function handleApi(request, response) {
       workingHoursPerDay: body.workingHoursPerDay || account.workingHoursPerDay || 6,
       outreachMode: "opt_in"
     });
-    if (!policy.ok) {
-      sendJson(response, 422, { ok: false, errors: policy.errors });
-      return;
-    }
-
-    account.salesSkill = body.salesSkill || account.salesSkill || "first_contact";
-    account.timerProfile = body.timerProfile || account.timerProfile || "wait_60s";
-    account.promptText = body.promptText || "";
-    account.replyDelaySeconds = timer.replyDelaySeconds;
-    account.repeatIntervalMinutes = timer.repeatIntervalMinutes;
-    account.typingSeconds = 5;
-    account.workingHoursPerDay = Number(body.workingHoursPerDay || account.workingHoursPerDay || 6);
-    sendJson(response, 200, { ok: true, account });
+    if (!policy.ok) { sendJson(response, 422, { ok: false, errors: policy.errors }); return; }
+    const updated = updateAccountSettings(body.accountId, {
+      salesSkill: body.salesSkill || account.salesSkill || "first_contact",
+      timerProfile: body.timerProfile || account.timerProfile || "wait_60s",
+      promptText: body.promptText ?? account.promptText ?? "",
+      replyDelaySeconds: timer.replyDelaySeconds,
+      repeatIntervalMinutes: timer.repeatIntervalMinutes,
+      typingSeconds: 5,
+      workingHoursPerDay: Number(body.workingHoursPerDay || account.workingHoursPerDay || 6),
+      databaseId: body.databaseId ?? account.databaseId
+    });
+    sendJson(response, 200, { ok: true, account: updated });
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/leads/comment") {
+  if (request.method === "POST" && path === "/api/imports") {
     const body = await readBody(request);
-    const lead = store.leads.find((item) => item.id === body.leadId);
-    if (!lead) {
-      sendJson(response, 404, { ok: false, error: "Сделка не найдена" });
-      return;
+    const contacts = parseTelegramContacts({
+      contacts: body.contacts || body.csv || "",
+      fileBase64: body.fileBase64 || "",
+      filename: body.filename || "telegram-contacts.txt"
+    });
+    const id = `db-${Date.now()}`;
+    const item = insertDatabase({
+      id,
+      filename: body.filename || "telegram-contacts.txt",
+      total: contacts.total,
+      valid: contacts.valid,
+      rejected: contacts.rejected,
+      sample: contacts.sample,
+      contacts: contacts.contacts
+    });
+    if (body.accountId) {
+      updateAccountSettings(body.accountId, { databaseId: id });
     }
+    sendJson(response, 201, { ok: true, import: item });
+    return;
+  }
 
-    lead.comment = body.comment || "";
+  if (request.method === "POST" && path === "/api/leads/comment") {
+    const body = await readBody(request);
+    const lead = updateLeadComment(body.leadId, body.comment || "");
+    if (!lead) { sendJson(response, 404, { ok: false, error: "Сделка не найдена" }); return; }
     sendJson(response, 200, { ok: true, lead });
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/ai-summary") {
+  if (request.method === "POST" && path === "/api/ai-summary") {
     const user = getSessionUser(request);
     const limit = checkAiRateLimit(user);
-    if (!limit.ok) {
-      sendJson(response, 429, { ok: false, error: limit.error });
-      return;
-    }
+    if (!limit.ok) { sendJson(response, 429, { ok: false, error: limit.error }); return; }
     const body = await readBody(request);
-    const account = store.accounts.find((item) => item.id === body.accountId);
-    if (!account) {
-      sendJson(response, 404, { ok: false, error: "Аккаунт не найден" });
-      return;
-    }
-
-    const leads = store.leads.filter((lead) => lead.accountId === account.id);
+    const account = getAccount(body.accountId);
+    if (!account) { sendJson(response, 404, { ok: false, error: "Аккаунт не найден" }); return; }
+    const snap = getSnapshot();
+    const leads = snap.leads.filter((lead) => lead.accountId === account.id);
     const answered = leads.filter((lead) => lead.lastReplyAt).length;
-    const summary = `${account.id}: ${leads.length} сделок, ${answered} с ответом. ${leads.map((lead) => `${lead.telegram} - ${lead.status}`).join(" ")}`;
+    const summary = `${account.id}: ${leads.length} сделок, ${answered} с ответом. ${leads.map((l) => `${l.telegram} - ${l.status}`).join(" ")}`;
     sendJson(response, 200, { ok: true, summary, question: body.question || "" });
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/ai/hold-summary") {
+  if (request.method === "POST" && path === "/api/ai/hold-summary") {
     const user = getSessionUser(request);
     const limit = checkAiRateLimit(user);
-    if (!limit.ok) {
-      sendJson(response, 429, { ok: false, error: limit.error });
-      return;
-    }
+    if (!limit.ok) { sendJson(response, 429, { ok: false, error: limit.error }); return; }
     sendJson(response, 200, { ok: true, summary: buildHoldSummary() });
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/ai/chat") {
+  if (request.method === "POST" && path === "/api/ai/chat") {
     const user = getSessionUser(request);
     const limit = checkAiRateLimit(user);
-    if (!limit.ok) {
-      sendJson(response, 429, { ok: false, error: limit.error });
-      return;
-    }
+    if (!limit.ok) { sendJson(response, 429, { ok: false, error: limit.error }); return; }
     const body = await readBody(request);
     const question = String(body.question || "").trim();
     const accountId = String(body.accountId || "").trim();
-    const account = store.accounts.find((item) => item.id === accountId);
-    const leads = account ? store.leads.filter((lead) => lead.accountId === account.id) : store.leads;
-    const hold = leads.filter((lead) => lead.stageId === "stage-hold").length;
-    const answered = leads.filter((lead) => lead.lastReplyAt).length;
+    const account = accountId ? getAccount(accountId) : null;
+    const snap = getSnapshot();
+    const leads = account ? snap.leads.filter((lead) => lead.accountId === account.id) : snap.leads;
+    const hold = leads.filter((l) => l.stageId === "stage-hold").length;
+    const answered = leads.filter((l) => l.lastReplyAt).length;
     const answer = `Системный ответ: ${account ? `${account.id} / ${account.name}` : "все аккаунты"}: ${leads.length} сделок, ${answered} ответов, ${hold} hold. Запрос: ${question || "без уточнения"}.`;
     sendJson(response, 200, { ok: true, answer });
     return;
@@ -563,12 +536,22 @@ export const server = http.createServer(async (request, response) => {
       await handleStatic(request, response);
     }
   } catch (error) {
-    sendJson(response, 500, { ok: false, error: error.message });
+    if (error instanceof BotApiError || error instanceof MtprotoError) {
+      reportError(response, error);
+    } else {
+      sendJson(response, 500, { ok: false, error: error.message });
+    }
   }
 });
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  server.listen(port, () => {
-    console.log(`Telegram CRM Console: http://localhost:${port}`);
+  server.listen(port, async () => {
+    console.log(`[tgbots] HTTP listening on :${port}, public=${publicBaseUrl || "(unset)"}`);
+    try {
+      await bootAllWorkers();
+      console.log(`[tgbots] mtproto workers booted`);
+    } catch (e) {
+      console.error(`[tgbots] mtproto boot failed`, e?.message);
+    }
   });
 }

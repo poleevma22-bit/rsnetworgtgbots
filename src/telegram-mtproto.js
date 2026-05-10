@@ -1,0 +1,189 @@
+// MTProto integration via gramjs.
+// Two-step auth: start (sendCode) -> confirm (signIn with code [+ password]).
+// On confirm, we persist the StringSession and start a long-running client that
+// records incoming DMs as leads.
+import { TelegramClient } from "telegram";
+import { StringSession } from "telegram/sessions/index.js";
+import { Api } from "telegram/index.js";
+import { randomBytes } from "node:crypto";
+import {
+  insertMtproto, insertMtprotoPending, getMtprotoPending, deleteMtprotoPending,
+  getMtprotoSession, getAccount, deleteAccount, listMtprotoAccounts,
+  upsertLead, updateAccountStatus
+} from "./db.js";
+
+export class MtprotoError extends Error {
+  constructor(message, status = 400, code) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+const apiId = Number(process.env.TG_API_ID || 0);
+const apiHash = process.env.TG_API_HASH || "";
+
+// Live clients keyed by bots.id, e.g. "mt-12345"
+const liveClients = new Map();
+
+function ensureCreds() {
+  if (!apiId || !apiHash) {
+    throw new MtprotoError("TG_API_ID/TG_API_HASH не настроены в env сервиса", 500);
+  }
+}
+
+function makeClient(sessionString = "") {
+  ensureCreds();
+  const session = new StringSession(sessionString);
+  return new TelegramClient(session, apiId, apiHash, {
+    connectionRetries: 5,
+    useWSS: false,
+    deviceModel: "rsnetworgtgbots",
+    systemVersion: "1.0",
+    appVersion: "0.1"
+  });
+}
+
+export async function startAuth({ phone }) {
+  ensureCreds();
+  if (!phone || !/^\+?\d{8,16}$/.test(phone)) {
+    throw new MtprotoError("Укажите телефон в формате +7XXXXXXXXXX", 422);
+  }
+  const client = makeClient();
+  await client.connect();
+  let sent;
+  try {
+    sent = await client.sendCode({ apiId, apiHash }, phone);
+  } catch (e) {
+    await client.disconnect().catch(() => {});
+    throw new MtprotoError(`sendCode failed: ${e.message}`, 502);
+  }
+  const sessionString = client.session.save();
+  await client.disconnect().catch(() => {});
+
+  const tempId = `mtp-${randomBytes(8).toString("hex")}`;
+  insertMtprotoPending({
+    id: tempId,
+    phone,
+    phoneCodeHash: sent.phoneCodeHash,
+    apiId,
+    apiHash,
+    sessionString
+  });
+  return { tempId, phoneCodeHash: sent.phoneCodeHash, isCodeViaApp: sent.isCodeViaApp ?? null };
+}
+
+export async function confirmAuth({ tempId, code, password }) {
+  const pending = getMtprotoPending(tempId);
+  if (!pending) throw new MtprotoError("Сессия авторизации не найдена или истекла", 404);
+
+  const client = makeClient(pending.session_string || "");
+  await client.connect();
+
+  let me;
+  try {
+    me = await client.invoke(new Api.auth.SignIn({
+      phoneNumber: pending.phone,
+      phoneCodeHash: pending.phone_code_hash,
+      phoneCode: String(code)
+    }));
+  } catch (e) {
+    if (e?.errorMessage === "SESSION_PASSWORD_NEEDED" || /SESSION_PASSWORD_NEEDED/.test(e?.message || "")) {
+      if (!password) {
+        await client.disconnect().catch(() => {});
+        return { needsPassword: true };
+      }
+      try {
+        me = await client.signInWithPassword({ apiId, apiHash }, { password });
+      } catch (e2) {
+        await client.disconnect().catch(() => {});
+        throw new MtprotoError(`2FA failed: ${e2.message}`, 401);
+      }
+    } else {
+      await client.disconnect().catch(() => {});
+      throw new MtprotoError(`signIn failed: ${e.message}`, 401, e?.errorMessage);
+    }
+  }
+
+  // Resolve self
+  const self = await client.getMe().catch(() => null);
+  const sessionString = client.session.save();
+  await client.disconnect().catch(() => {});
+
+  const id = `mt-${self?.id?.toString() || Date.now()}`;
+  if (getAccount(id)) {
+    deleteMtprotoPending(tempId);
+    throw new MtprotoError("Этот аккаунт уже подключён", 409);
+  }
+  insertMtproto({
+    id,
+    apiId,
+    phone: pending.phone,
+    sessionString,
+    telegramId: self?.id?.toString(),
+    username: self?.username || null,
+    firstName: self?.firstName || self?.first_name || null,
+    status: "connected",
+    health: "ok"
+  });
+  deleteMtprotoPending(tempId);
+
+  await startWorker(id).catch(err => console.error("[mtproto] worker start failed", id, err.message));
+  return { account: getAccount(id) };
+}
+
+export async function startWorker(id) {
+  const cred = getMtprotoSession(id);
+  if (!cred?.session_string) return null;
+  if (liveClients.has(id)) return liveClients.get(id);
+  ensureCreds();
+
+  const client = makeClient(cred.session_string);
+  await client.connect();
+  liveClients.set(id, client);
+
+  client.addEventHandler(async (event) => {
+    try {
+      const msg = event.message;
+      if (!msg || msg.out) return;
+      const senderId = msg.senderId?.toString() || null;
+      const peer = msg.peerId;
+      const chatId = peer?.userId?.toString() || peer?.chatId?.toString() || peer?.channelId?.toString() || senderId;
+      let handle = "";
+      try {
+        const sender = await msg.getSender();
+        handle = sender?.username ? `@${sender.username}` : (sender?.firstName || "");
+      } catch {}
+      upsertLead({
+        accountId: id,
+        chatId,
+        telegramUserId: senderId,
+        telegramHandle: handle,
+        message: msg.message || "",
+        direction: "in"
+      });
+      updateAccountStatus(id, { health: "ok", lastSeenAt: new Date().toISOString() });
+    } catch (err) {
+      console.error("[mtproto] event handler error", err.message);
+    }
+  });
+  return client;
+}
+
+export async function bootAllWorkers() {
+  for (const acc of listMtprotoAccounts()) {
+    if (acc.status !== "disabled") {
+      await startWorker(acc.id).catch(err => console.error("[mtproto] boot worker", acc.id, err.message));
+    }
+  }
+}
+
+export async function disconnectMtproto(id) {
+  const client = liveClients.get(id);
+  if (client) {
+    try { await client.disconnect(); } catch {}
+    liveClients.delete(id);
+  }
+  deleteAccount(id);
+  return { ok: true };
+}

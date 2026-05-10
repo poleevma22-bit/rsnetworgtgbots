@@ -1,2 +1,7 @@
 data/users.json
 node_modules/
+.env
+.env.local
+data/tgbots.sqlite3
+data/tgbots.sqlite3-shm
+data/tgbots.sqlite3-wal
