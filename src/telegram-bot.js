@@ -1,11 +1,17 @@
 // Telegram Bot API integration: connect, validate, setWebhook, ingest updates.
 import { randomBytes } from "node:crypto";
+import { readFileSync, existsSync } from "node:fs";
 import {
   insertBotApi, getAccount, deleteAccount, getBotApiToken,
   upsertLead, recordBotUpdate, updateAccountStatus, listBotApiAccounts
 } from "./db.js";
 
 const API = "https://api.telegram.org";
+
+// Optional: path to a self-signed cert that Telegram should pin for the
+// webhook URL. When set and the file exists, setWebhook uploads it via
+// multipart so Telegram trusts our origin without a public CA.
+const SELF_SIGNED_CERT_PATH = process.env.SELF_SIGNED_CERT_PATH || "";
 
 export class BotApiError extends Error {
   constructor(message, status = 400, payload) {
@@ -21,6 +27,20 @@ async function tg(token, method, body) {
     headers: { "content-type": "application/json" },
     body: body ? JSON.stringify(body) : undefined
   });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !json.ok) {
+    throw new BotApiError(json.description || `Telegram ${method} failed`, res.status, json);
+  }
+  return json.result;
+}
+
+async function tgMultipart(token, method, fields) {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined || value === null) continue;
+    form.append(key, value);
+  }
+  const res = await fetch(`${API}/bot${token}/${method}`, { method: "POST", body: form });
   const json = await res.json().catch(() => ({}));
   if (!res.ok || !json.ok) {
     throw new BotApiError(json.description || `Telegram ${method} failed`, res.status, json);
@@ -70,11 +90,24 @@ export async function setWebhookForBot(id, publicBaseUrl) {
   const cred = getBotApiToken(id);
   if (!cred) throw new BotApiError("Бот не найден", 404);
   const url = `${publicBaseUrl.replace(/\/$/, "")}/api/telegram/webhook/${id}`;
-  const result = await tg(cred.token, "setWebhook", {
-    url,
-    secret_token: cred.webhook_secret,
-    allowed_updates: ["message", "edited_message", "callback_query"]
-  });
+
+  let result;
+  if (SELF_SIGNED_CERT_PATH && existsSync(SELF_SIGNED_CERT_PATH)) {
+    // Upload self-signed cert so Telegram pins our origin.
+    const certBlob = new Blob([readFileSync(SELF_SIGNED_CERT_PATH)], { type: "application/x-pem-file" });
+    result = await tgMultipart(cred.token, "setWebhook", {
+      url,
+      secret_token: cred.webhook_secret,
+      allowed_updates: JSON.stringify(["message", "edited_message", "callback_query"]),
+      certificate: new File([certBlob], "cert.pem", { type: "application/x-pem-file" })
+    });
+  } else {
+    result = await tg(cred.token, "setWebhook", {
+      url,
+      secret_token: cred.webhook_secret,
+      allowed_updates: ["message", "edited_message", "callback_query"]
+    });
+  }
   updateAccountStatus(id, { status: "connected", health: "ok", lastSeenAt: new Date().toISOString() });
   return { url, result };
 }
