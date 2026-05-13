@@ -27,6 +27,9 @@ import {
   startConversationWorker, handleInboundMessage as handleConversationInbound
 } from "./conversation.js";
 import { setInboundHook } from "./telegram-mtproto.js";
+import {
+  listThreadsByBroadcast, getThreadHistory
+} from "./db.js";
 
 const root = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
 const publicDir = join(root, "public");
@@ -463,6 +466,30 @@ async function handleApi(request, response) {
       const job = cancelBroadcast(bcMatch[1]);
       sendJson(response, 200, { ok: true, job });
     } catch (e) { reportError(response, e); }
+    return;
+  }
+
+  // GET /api/telegram/broadcast/:id/threads — conversation threads tied to
+  // this broadcast, with the last few messages each.
+  const bcThreadsMatch = path.match(/^\/api\/telegram\/broadcast\/([^/]+)\/threads$/);
+  if (request.method === "GET" && bcThreadsMatch) {
+    const broadcastId = bcThreadsMatch[1];
+    const threads = listThreadsByBroadcast(broadcastId, 200).map((t) => ({
+      id: t.id,
+      accountId: t.account_id,
+      broadcastId: t.broadcast_id,
+      targetUsername: t.target_username,
+      targetTelegramId: t.target_telegram_id,
+      state: t.state,
+      inboundCount: t.inbound_count,
+      outboundCount: t.outbound_count,
+      lastInboundAt: t.last_inbound_at,
+      lastOutboundAt: t.last_outbound_at,
+      nextActionAt: t.next_action_at,
+      nextActionType: t.next_action_type,
+      messages: getThreadHistory(t.id, 30),
+    }));
+    sendJson(response, 200, { ok: true, threads });
     return;
   }
 
