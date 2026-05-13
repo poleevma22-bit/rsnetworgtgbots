@@ -99,25 +99,32 @@ export async function confirmAuth({ tempId, code, password }) {
         await client.disconnect().catch(() => {});
         return { needsPassword: true };
       }
+      // gramjs signInWithPassword requires password/onError as async thunks.
+      // When onError returns true, gramjs swallows the original error and
+      // throws a generic "AUTH_USER_CANCEL" — so we capture the real cause
+      // via onError and surface it on the outer rejection.
+      let underlyingError = null;
       try {
-        // gramjs signInWithPassword requires both password and onError to be
-        // async-callable thunks (it invokes them internally during SRP).
-        // Passing a raw string previously broke with
-        //   "2FA failed: authParams.onError is not a function".
         me = await client.signInWithPassword(
           { apiId, apiHash },
           {
             password: async () => password,
             onError: async (err) => {
-              console.error("[mtproto] 2FA password flow error:", err?.message || err);
-              // returning true tells gramjs to stop retrying.
-              return true;
+              underlyingError = err;
+              console.error("[mtproto] 2FA SRP error:", err?.errorMessage || err?.message || err);
+              return true; // stop retrying; we surface the saved error below.
             }
           }
         );
       } catch (e2) {
         await client.disconnect().catch(() => {});
-        throw new MtprotoError(`2FA failed: ${e2.message}`, 401);
+        const detail =
+          underlyingError?.errorMessage ||
+          underlyingError?.message ||
+          e2?.errorMessage ||
+          e2?.message ||
+          "unknown";
+        throw new MtprotoError(`2FA failed: ${detail}`, 401);
       }
     } else {
       await client.disconnect().catch(() => {});
