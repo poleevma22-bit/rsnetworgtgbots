@@ -19,6 +19,10 @@ import {
 import {
   startAuth, confirmAuth, disconnectMtproto, bootAllWorkers, MtprotoError
 } from "./telegram-mtproto.js";
+import {
+  startBroadcast, cancelBroadcast, listBroadcasts, getBroadcast,
+  resumeRunningBroadcasts, BroadcastError
+} from "./broadcast.js";
 
 const root = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
 const publicDir = join(root, "public");
@@ -213,7 +217,10 @@ async function readBody(request) {
 }
 
 function reportError(response, error) {
-  const status = error?.status || 500;
+  const status =
+    error?.status ||
+    error?.statusCode ||
+    (error instanceof BroadcastError ? 422 : 500);
   sendJson(response, status, { ok: false, error: error?.message || "Internal error", code: error?.code });
 }
 
@@ -409,6 +416,42 @@ async function handleApi(request, response) {
     return;
   }
 
+  // --- Broadcasts ---
+
+  if (request.method === "POST" && path === "/api/telegram/broadcast") {
+    const body = await readBody(request);
+    try {
+      const job = startBroadcast({
+        accountId: String(body.accountId || ""),
+        messageText: String(body.messageText || ""),
+        targets: Array.isArray(body.targets) ? body.targets : [],
+        intervalMs: body.intervalMs
+      });
+      sendJson(response, 200, { ok: true, job });
+    } catch (e) { reportError(response, e); }
+    return;
+  }
+
+  if (request.method === "GET" && path === "/api/telegram/broadcast") {
+    sendJson(response, 200, { ok: true, jobs: listBroadcasts(50) });
+    return;
+  }
+
+  const bcMatch = path.match(/^\/api\/telegram\/broadcast\/([^/]+)$/);
+  if (request.method === "GET" && bcMatch) {
+    const job = getBroadcast(bcMatch[1]);
+    if (!job) { sendJson(response, 404, { ok: false, error: "Broadcast not found" }); return; }
+    sendJson(response, 200, { ok: true, job });
+    return;
+  }
+  if (request.method === "DELETE" && bcMatch) {
+    try {
+      const job = cancelBroadcast(bcMatch[1]);
+      sendJson(response, 200, { ok: true, job });
+    } catch (e) { reportError(response, e); }
+    return;
+  }
+
   // --- Existing endpoints (now backed by db where applicable) ---
 
   if (request.method === "POST" && path === "/api/account-settings") {
@@ -557,6 +600,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       console.log(`[tgbots] mtproto workers booted`);
     } catch (e) {
       console.error(`[tgbots] mtproto boot failed`, e?.message);
+    }
+    try {
+      resumeRunningBroadcasts();
+    } catch (e) {
+      console.error(`[tgbots] broadcast resume failed`, e?.message);
     }
   });
 }

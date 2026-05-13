@@ -159,6 +159,31 @@ export async function confirmAuth({ tempId, code, password }) {
   return { account: getAccount(id) };
 }
 
+/**
+ * Send a one-off direct message from a connected MTProto account.
+ * Resolves @username via gramjs (which calls contacts.ResolveUsername under the hood).
+ * Phone numbers only work if the recipient is already in the sender's contacts.
+ */
+export async function sendDirectMessage(accountId, target, text) {
+  if (!accountId) throw new MtprotoError("accountId required", 400);
+  if (!text || typeof text !== "string" || !text.trim()) {
+    throw new MtprotoError("Message text is empty", 400);
+  }
+  const cleaned = String(target || "").trim().replace(/^@/, "");
+  if (!cleaned) throw new MtprotoError("Empty target", 400);
+
+  // Start (or reuse) the live client for this account.
+  await startWorker(accountId);
+  const client = liveClients.get(accountId);
+  if (!client) {
+    throw new MtprotoError(`MTProto client not running for ${accountId}`, 503);
+  }
+
+  // gramjs accepts a username string and resolves it internally.
+  const result = await client.sendMessage(cleaned, { message: text });
+  return { messageId: result?.id?.toString() ?? null };
+}
+
 export async function startWorker(id) {
   const cred = getMtprotoSession(id);
   if (!cred?.session_string) return null;

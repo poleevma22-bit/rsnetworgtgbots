@@ -92,6 +92,23 @@ db.exec(`
     expires_at  INTEGER NOT NULL             -- epoch ms
   );
   CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+  CREATE TABLE IF NOT EXISTS broadcast_jobs (
+    id              TEXT PRIMARY KEY,
+    account_id      TEXT NOT NULL,
+    message_text    TEXT NOT NULL,
+    interval_ms     INTEGER NOT NULL,
+    targets_json    TEXT NOT NULL,           -- JSON [{ target, status, error?, sentAt? }]
+    status          TEXT NOT NULL,           -- running | done | cancelled | failed
+    cursor          INTEGER NOT NULL DEFAULT 0,
+    sent_count      INTEGER NOT NULL DEFAULT 0,
+    failed_count    INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      INTEGER NOT NULL,
+    started_at      INTEGER,
+    finished_at     INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_broadcast_status ON broadcast_jobs(status, created_at DESC);
 `);
 
 // --- Sessions (persistent so pm2 restarts don't log everyone out) ---
@@ -124,6 +141,50 @@ export function deleteSession(token) {
 
 export function purgeExpiredSessions() {
   db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now());
+}
+
+// --- Broadcasts ---
+
+export function insertBroadcastJob({
+  id, accountId, messageText, intervalMs, targets, status, createdAt, startedAt
+}) {
+  db.prepare(`
+    INSERT INTO broadcast_jobs
+      (id, account_id, message_text, interval_ms, targets_json, status, created_at, started_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, accountId, messageText, intervalMs, JSON.stringify(targets || []), status, createdAt, startedAt ?? null);
+  return getBroadcastJob(id);
+}
+
+export function getBroadcastJob(id) {
+  return db.prepare("SELECT * FROM broadcast_jobs WHERE id = ?").get(id) || null;
+}
+
+export function listBroadcastJobs(limit = 50) {
+  return db.prepare("SELECT * FROM broadcast_jobs ORDER BY created_at DESC LIMIT ?").all(limit);
+}
+
+export function listActiveBroadcastJobs() {
+  return db.prepare("SELECT * FROM broadcast_jobs WHERE status = 'running' ORDER BY created_at DESC").all();
+}
+
+export function updateBroadcastJob(id, fields) {
+  const cols = [];
+  const vals = [];
+  for (const [k, v] of Object.entries(fields)) {
+    cols.push(`${k} = ?`);
+    vals.push(v);
+  }
+  if (!cols.length) return getBroadcastJob(id);
+  vals.push(id);
+  db.prepare(`UPDATE broadcast_jobs SET ${cols.join(", ")} WHERE id = ?`).run(...vals);
+  return getBroadcastJob(id);
+}
+
+export function markBroadcastFinished(id, status) {
+  db.prepare("UPDATE broadcast_jobs SET status = ?, finished_at = ? WHERE id = ?")
+    .run(status, Date.now(), id);
+  return getBroadcastJob(id);
 }
 
 // --- Helpers ---
