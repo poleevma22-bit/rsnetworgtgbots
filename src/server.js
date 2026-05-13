@@ -23,6 +23,10 @@ import {
   startBroadcast, cancelBroadcast, listBroadcasts, getBroadcast,
   resumeRunningBroadcasts, BroadcastError
 } from "./broadcast.js";
+import {
+  startConversationWorker, handleInboundMessage as handleConversationInbound
+} from "./conversation.js";
+import { setInboundHook } from "./telegram-mtproto.js";
 
 const root = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
 const publicDir = join(root, "public");
@@ -615,6 +619,14 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       resumeRunningBroadcasts();
     } catch (e) {
       console.error(`[tgbots] broadcast resume failed`, e?.message);
+    }
+    // Wire mtproto inbound messages → conversation worker, then start the
+    // worker ticker that drives AI replies + repeats.
+    setInboundHook(handleConversationInbound);
+    try {
+      startConversationWorker();
+    } catch (e) {
+      console.error(`[tgbots] conversation worker boot failed`, e?.message);
     }
   });
 }

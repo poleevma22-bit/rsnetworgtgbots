@@ -14,6 +14,7 @@ import {
   markBroadcastFinished
 } from "./db.js";
 import { sendDirectMessage } from "./telegram-mtproto.js";
+import { registerOutboundSend } from "./conversation.js";
 
 // jobId -> NodeJS Timer
 const runningTimers = new Map();
@@ -154,6 +155,21 @@ async function processOne(jobId) {
     if (sendResult?.messageId) entry.messageId = sendResult.messageId;
     updates.sent_count = job.sent_count + 1;
     console.log(`[broadcast] ${jobId} sent to @${entry.target} (${idx + 1}/${targets.length})`);
+    // Materialise a conversation thread so the worker can attach replies
+    // and schedule repeats. Errors here must not block the broadcast.
+    try {
+      registerOutboundSend({
+        accountId: job.account_id,
+        broadcastId: job.id,
+        targetUsername: entry.target,
+        messageText: job.message_text,
+        messageId: sendResult?.messageId,
+        repeatEnabled: Boolean(job.repeat_enabled),
+        repeatIntervalMs: Number(job.repeat_interval_ms) || 0,
+      });
+    } catch (e) {
+      console.warn(`[broadcast] registerOutboundSend failed for ${entry.target}: ${e?.message || e}`);
+    }
   } catch (err) {
     entry.status = "failed";
     entry.error = String(err?.message || err).slice(0, 240);

@@ -159,6 +159,14 @@ export async function confirmAuth({ tempId, code, password }) {
   return { account: getAccount(id) };
 }
 
+// Hook injected by ./conversation.js. Called for every inbound DM observed
+// by a connected MTProto user-account. Kept as a late-bound singleton to
+// dodge circular-import issues between mtproto/conversation/db.
+let inboundHook = null;
+export function setInboundHook(fn) {
+  inboundHook = typeof fn === "function" ? fn : null;
+}
+
 /**
  * Send a one-off direct message from a connected MTProto account.
  * Resolves @username via gramjs (which calls contacts.ResolveUsername under the hood).
@@ -237,19 +245,37 @@ export async function startWorker(id) {
       const peer = msg.peerId;
       const chatId = peer?.userId?.toString() || peer?.chatId?.toString() || peer?.channelId?.toString() || senderId;
       let handle = "";
+      let usernameOnly = "";
       try {
         const sender = await msg.getSender();
+        usernameOnly = sender?.username ? String(sender.username).toLowerCase() : "";
         handle = sender?.username ? `@${sender.username}` : (sender?.firstName || "");
       } catch {}
+      const text = msg.message || "";
       upsertLead({
         accountId: id,
         chatId,
         telegramUserId: senderId,
         telegramHandle: handle,
-        message: msg.message || "",
+        message: text,
         direction: "in"
       });
       updateAccountStatus(id, { health: "ok", lastSeenAt: new Date().toISOString() });
+
+      // Hand the inbound to the conversation worker if one is attached.
+      // Set via setInboundHook on boot so we avoid circular imports.
+      if (typeof inboundHook === "function") {
+        try {
+          inboundHook({
+            accountId: id,
+            fromUsername: usernameOnly,
+            fromTelegramId: senderId,
+            text,
+          });
+        } catch (e) {
+          console.error("[mtproto] inboundHook error", e?.message || e);
+        }
+      }
     } catch (err) {
       console.error("[mtproto] event handler error", err.message);
     }

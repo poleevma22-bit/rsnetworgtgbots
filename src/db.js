@@ -120,6 +120,40 @@ db.exec(`
     repeat_interval_ms  INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_broadcast_status ON broadcast_jobs(status, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS conversation_threads (
+    id                   TEXT PRIMARY KEY,
+    account_id           TEXT NOT NULL,
+    broadcast_id         TEXT,
+    target_username      TEXT,                  -- normalised, no leading @
+    target_telegram_id   TEXT,
+    state                TEXT NOT NULL DEFAULT 'active',   -- active | completed | failed
+    last_inbound_at      INTEGER,
+    last_outbound_at     INTEGER,
+    next_action_at       INTEGER,               -- ms epoch; null = no pending action
+    next_action_type     TEXT,                  -- 'ai_reply' | 'repeat'
+    next_action_payload  TEXT,                  -- JSON
+    inbound_count        INTEGER NOT NULL DEFAULT 0,
+    outbound_count       INTEGER NOT NULL DEFAULT 0,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_threads_next_action
+    ON conversation_threads(next_action_at)
+    WHERE next_action_at IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_threads_account_target
+    ON conversation_threads(account_id, target_username);
+
+  CREATE TABLE IF NOT EXISTS conversation_messages (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id            TEXT NOT NULL REFERENCES conversation_threads(id) ON DELETE CASCADE,
+    direction            TEXT NOT NULL,         -- 'in' | 'out'
+    text                 TEXT NOT NULL,
+    telegram_message_id  TEXT,
+    sent_at              INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_messages_thread
+    ON conversation_messages(thread_id, sent_at);
 `);
 
 // --- Migration: backfill v2 columns on existing broadcast_jobs rows. ALTER ADD COLUMN
@@ -489,4 +523,128 @@ export function getMtprotoPending(id) {
 
 export function deleteMtprotoPending(id) {
   db.prepare("DELETE FROM mtproto_pending WHERE id = ?").run(id);
+}
+
+// --- Conversation threads & messages ---
+
+export function findOrCreateThread({
+  accountId,
+  broadcastId,
+  targetUsername,
+  targetTelegramId
+}) {
+  if (!accountId) throw new Error("accountId required");
+  const usernameKey = String(targetUsername || "").toLowerCase().replace(/^@/, "");
+  // Look up by (account_id, target_username) or (account_id, target_telegram_id).
+  const existing = db.prepare(`
+    SELECT * FROM conversation_threads
+    WHERE account_id = ?
+      AND (
+        (? != '' AND target_username = ?) OR
+        (? != '' AND target_telegram_id = ?)
+      )
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(
+    accountId,
+    usernameKey, usernameKey,
+    String(targetTelegramId || ""), String(targetTelegramId || "")
+  );
+  if (existing) return existing;
+
+  const now = Date.now();
+  const id = `th-${Math.random().toString(36).slice(2, 10)}-${now.toString(36)}`;
+  db.prepare(`
+    INSERT INTO conversation_threads
+      (id, account_id, broadcast_id, target_username, target_telegram_id, state, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+  `).run(
+    id, accountId, broadcastId || null, usernameKey || null,
+    targetTelegramId ? String(targetTelegramId) : null, now, now
+  );
+  return getThread(id);
+}
+
+export function getThread(id) {
+  return db.prepare("SELECT * FROM conversation_threads WHERE id = ?").get(id) || null;
+}
+
+export function listReadyThreads(now = Date.now(), limit = 50) {
+  return db.prepare(`
+    SELECT * FROM conversation_threads
+    WHERE next_action_at IS NOT NULL
+      AND next_action_at <= ?
+      AND state = 'active'
+    ORDER BY next_action_at ASC
+    LIMIT ?
+  `).all(now, limit);
+}
+
+export function listThreadsByBroadcast(broadcastId, limit = 200) {
+  return db.prepare(`
+    SELECT * FROM conversation_threads
+    WHERE broadcast_id = ?
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(broadcastId, limit);
+}
+
+export function updateThread(id, fields) {
+  const cols = ["updated_at = ?"];
+  const vals = [Date.now()];
+  for (const [k, v] of Object.entries(fields)) {
+    cols.push(`${k} = ?`);
+    vals.push(v);
+  }
+  vals.push(id);
+  db.prepare(`UPDATE conversation_threads SET ${cols.join(", ")} WHERE id = ?`).run(...vals);
+  return getThread(id);
+}
+
+export function scheduleThreadAction(id, atMs, type, payload) {
+  return updateThread(id, {
+    next_action_at: atMs,
+    next_action_type: type,
+    next_action_payload: payload ? JSON.stringify(payload) : null
+  });
+}
+
+export function clearThreadAction(id) {
+  return updateThread(id, {
+    next_action_at: null,
+    next_action_type: null,
+    next_action_payload: null
+  });
+}
+
+export function appendThreadMessage({ threadId, direction, text, telegramMessageId }) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO conversation_messages (thread_id, direction, text, telegram_message_id, sent_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(threadId, direction, text, telegramMessageId || null, now);
+  // Bump counters and timestamps on the thread.
+  if (direction === "in") {
+    db.prepare(`
+      UPDATE conversation_threads
+      SET inbound_count = inbound_count + 1, last_inbound_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(now, now, threadId);
+  } else {
+    db.prepare(`
+      UPDATE conversation_threads
+      SET outbound_count = outbound_count + 1, last_outbound_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(now, now, threadId);
+  }
+}
+
+export function getThreadHistory(threadId, limit = 40) {
+  return db.prepare(`
+    SELECT direction, text, sent_at
+    FROM conversation_messages
+    WHERE thread_id = ?
+    ORDER BY sent_at ASC, id ASC
+    LIMIT ?
+  `).all(threadId, limit);
 }
