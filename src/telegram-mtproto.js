@@ -5,6 +5,7 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { Api } from "telegram/index.js";
+import { NewMessage } from "telegram/events/index.js";
 import { randomBytes } from "node:crypto";
 import {
   insertMtproto, insertMtprotoPending, getMtprotoPending, deleteMtprotoPending,
@@ -237,10 +238,20 @@ export async function startWorker(id) {
   await client.connect();
   liveClients.set(id, client);
 
-  client.addEventHandler(async (event) => {
+  // Use the NewMessage event filter so we only fire on actual incoming
+  // text messages — not service updates, typing notifications, etc.
+  // outgoing: false → drop echoes of our own sends.
+  const newMessageHandler = async (event) => {
     try {
       const msg = event.message;
       if (!msg || msg.out) return;
+      // Skip empty / non-text payloads (stickers without text, photos with no caption, etc.).
+      const text = (typeof msg.message === "string" && msg.message.trim()) ? msg.message : "";
+      if (!text) {
+        console.log(`[mtproto] ${id} inbound non-text msg, skipping (id=${msg.id})`);
+        return;
+      }
+
       const senderId = msg.senderId?.toString() || null;
       const peer = msg.peerId;
       const chatId = peer?.userId?.toString() || peer?.chatId?.toString() || peer?.channelId?.toString() || senderId;
@@ -250,8 +261,11 @@ export async function startWorker(id) {
         const sender = await msg.getSender();
         usernameOnly = sender?.username ? String(sender.username).toLowerCase() : "";
         handle = sender?.username ? `@${sender.username}` : (sender?.firstName || "");
-      } catch {}
-      const text = msg.message || "";
+      } catch (e) {
+        console.warn(`[mtproto] ${id} getSender failed: ${e?.message || e}`);
+      }
+      console.log(`[mtproto] ${id} inbound from senderId=${senderId} username=${usernameOnly || "(none)"} text="${text.slice(0, 80)}"`);
+
       upsertLead({
         accountId: id,
         chatId,
@@ -263,7 +277,6 @@ export async function startWorker(id) {
       updateAccountStatus(id, { health: "ok", lastSeenAt: new Date().toISOString() });
 
       // Hand the inbound to the conversation worker if one is attached.
-      // Set via setInboundHook on boot so we avoid circular imports.
       if (typeof inboundHook === "function") {
         try {
           inboundHook({
@@ -279,7 +292,9 @@ export async function startWorker(id) {
     } catch (err) {
       console.error("[mtproto] event handler error", err.message);
     }
-  });
+  };
+  client.addEventHandler(newMessageHandler, new NewMessage({ incoming: true, outgoing: false }));
+  console.log(`[mtproto] ${id} event handler attached (NewMessage incoming-only)`);
   return client;
 }
 
