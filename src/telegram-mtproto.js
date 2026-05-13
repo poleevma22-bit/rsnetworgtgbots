@@ -46,9 +46,15 @@ function makeClient(sessionString = "") {
 
 export async function startAuth({ phone }) {
   ensureCreds();
-  if (!phone || !/^\+?\d{8,16}$/.test(phone)) {
-    throw new MtprotoError("Укажите телефон в формате +7XXXXXXXXXX", 422);
+  // Country-agnostic normalisation: strip spaces, dashes, parens, dots before validating.
+  const normalized = typeof phone === "string" ? phone.replace(/[\s\-().]/g, "") : "";
+  if (!normalized || !/^\+?\d{8,16}$/.test(normalized)) {
+    throw new MtprotoError(
+      "Введите номер телефона в международном формате, например +447700900000",
+      422
+    );
   }
+  phone = normalized;
   const client = makeClient();
   await client.connect();
   let sent;
