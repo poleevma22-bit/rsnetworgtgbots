@@ -163,8 +163,13 @@ export async function confirmAuth({ tempId, code, password }) {
  * Send a one-off direct message from a connected MTProto account.
  * Resolves @username via gramjs (which calls contacts.ResolveUsername under the hood).
  * Phone numbers only work if the recipient is already in the sender's contacts.
+ *
+ * Options:
+ *   typingMinMs / typingMaxMs — emit a "typing…" status to the peer for
+ *     a random duration in this range before actually sending the message.
+ *     Defaults: 5_000 / 10_000 (5–10 seconds). Pass 0 to skip.
  */
-export async function sendDirectMessage(accountId, target, text) {
+export async function sendDirectMessage(accountId, target, text, options = {}) {
   if (!accountId) throw new MtprotoError("accountId required", 400);
   if (!text || typeof text !== "string" || !text.trim()) {
     throw new MtprotoError("Message text is empty", 400);
@@ -177,6 +182,36 @@ export async function sendDirectMessage(accountId, target, text) {
   const client = liveClients.get(accountId);
   if (!client) {
     throw new MtprotoError(`MTProto client not running for ${accountId}`, 503);
+  }
+
+  // Optional "natural-looking" typing simulation before the actual send.
+  const typingMin = Number.isFinite(options.typingMinMs) ? Math.max(0, options.typingMinMs) : 5000;
+  const typingMax = Number.isFinite(options.typingMaxMs) ? Math.max(typingMin, options.typingMaxMs) : 10000;
+  if (typingMax > 0) {
+    const delay = Math.floor(typingMin + Math.random() * Math.max(1, typingMax - typingMin));
+    try {
+      const peer = await client.getInputEntity(cleaned);
+      // Re-emit every 4s — gramjs typing action only persists ~5s on Telegram side.
+      const tickMs = 4000;
+      const start = Date.now();
+      const tick = async () => {
+        try {
+          await client.invoke(new Api.messages.SetTyping({
+            peer,
+            action: new Api.SendMessageTypingAction()
+          }));
+        } catch { /* swallow — typing is best-effort */ }
+      };
+      await tick();
+      while (Date.now() - start < delay) {
+        const left = delay - (Date.now() - start);
+        await new Promise((r) => setTimeout(r, Math.min(tickMs, left)));
+        if (Date.now() - start < delay) await tick();
+      }
+    } catch (err) {
+      // Typing errors must NOT block sending. Just log.
+      console.warn(`[mtproto] typing simulation failed for @${cleaned}: ${err?.message || err}`);
+    }
   }
 
   // gramjs accepts a username string and resolves it internally.

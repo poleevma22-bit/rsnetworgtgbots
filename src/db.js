@@ -94,22 +94,52 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
   CREATE TABLE IF NOT EXISTS broadcast_jobs (
-    id              TEXT PRIMARY KEY,
-    account_id      TEXT NOT NULL,
-    message_text    TEXT NOT NULL,
-    interval_ms     INTEGER NOT NULL,
-    targets_json    TEXT NOT NULL,           -- JSON [{ target, status, error?, sentAt? }]
-    status          TEXT NOT NULL,           -- running | done | cancelled | failed
-    cursor          INTEGER NOT NULL DEFAULT 0,
-    sent_count      INTEGER NOT NULL DEFAULT 0,
-    failed_count    INTEGER NOT NULL DEFAULT 0,
-    last_error      TEXT,
-    created_at      INTEGER NOT NULL,
-    started_at      INTEGER,
-    finished_at     INTEGER
+    id                  TEXT PRIMARY KEY,
+    account_id          TEXT NOT NULL,
+    message_text        TEXT NOT NULL,
+    interval_ms         INTEGER NOT NULL,
+    targets_json        TEXT NOT NULL,           -- JSON [{ target, status, error?, sentAt? }]
+    status              TEXT NOT NULL,           -- running | done | cancelled | failed
+    cursor              INTEGER NOT NULL DEFAULT 0,
+    sent_count          INTEGER NOT NULL DEFAULT 0,
+    failed_count        INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT,
+    created_at          INTEGER NOT NULL,
+    started_at          INTEGER,
+    finished_at         INTEGER,
+    -- v2 fields (Phase 1: task type, sales context, behavioural defaults)
+    task_type           TEXT NOT NULL DEFAULT 'cold',  -- ping | cold | warm
+    sales_script        TEXT NOT NULL DEFAULT '',      -- long prompt with examples
+    dialog_scenarios    TEXT NOT NULL DEFAULT '',      -- expected client replies + branches
+    terminology         TEXT NOT NULL DEFAULT '',      -- domain glossary used by AI later
+    typing_min_ms       INTEGER NOT NULL DEFAULT 5000,
+    typing_max_ms       INTEGER NOT NULL DEFAULT 10000,
+    reply_ignore_min_ms INTEGER NOT NULL DEFAULT 60000,
+    reply_ignore_max_ms INTEGER NOT NULL DEFAULT 120000,
+    repeat_enabled      INTEGER NOT NULL DEFAULT 0,    -- 0/1
+    repeat_interval_ms  INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_broadcast_status ON broadcast_jobs(status, created_at DESC);
 `);
+
+// --- Migration: backfill v2 columns on existing broadcast_jobs rows. ALTER ADD COLUMN
+// is idempotent if we trap the "duplicate column" error, so this is safe to re-run.
+const __BROADCAST_V2_COLS = [
+  ["task_type", "TEXT NOT NULL DEFAULT 'cold'"],
+  ["sales_script", "TEXT NOT NULL DEFAULT ''"],
+  ["dialog_scenarios", "TEXT NOT NULL DEFAULT ''"],
+  ["terminology", "TEXT NOT NULL DEFAULT ''"],
+  ["typing_min_ms", "INTEGER NOT NULL DEFAULT 5000"],
+  ["typing_max_ms", "INTEGER NOT NULL DEFAULT 10000"],
+  ["reply_ignore_min_ms", "INTEGER NOT NULL DEFAULT 60000"],
+  ["reply_ignore_max_ms", "INTEGER NOT NULL DEFAULT 120000"],
+  ["repeat_enabled", "INTEGER NOT NULL DEFAULT 0"],
+  ["repeat_interval_ms", "INTEGER NOT NULL DEFAULT 0"]
+];
+for (const [col, decl] of __BROADCAST_V2_COLS) {
+  try { db.exec(`ALTER TABLE broadcast_jobs ADD COLUMN ${col} ${decl}`); }
+  catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+}
 
 // --- Sessions (persistent so pm2 restarts don't log everyone out) ---
 
@@ -146,13 +176,35 @@ export function purgeExpiredSessions() {
 // --- Broadcasts ---
 
 export function insertBroadcastJob({
-  id, accountId, messageText, intervalMs, targets, status, createdAt, startedAt
+  id, accountId, messageText, intervalMs, targets, status, createdAt, startedAt,
+  // v2 fields — all optional, sensible defaults match the SQL DEFAULTs.
+  taskType = "cold",
+  salesScript = "",
+  dialogScenarios = "",
+  terminology = "",
+  typingMinMs = 5000,
+  typingMaxMs = 10000,
+  replyIgnoreMinMs = 60000,
+  replyIgnoreMaxMs = 120000,
+  repeatEnabled = false,
+  repeatIntervalMs = 0
 }) {
   db.prepare(`
     INSERT INTO broadcast_jobs
-      (id, account_id, message_text, interval_ms, targets_json, status, created_at, started_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, accountId, messageText, intervalMs, JSON.stringify(targets || []), status, createdAt, startedAt ?? null);
+      (id, account_id, message_text, interval_ms, targets_json, status, created_at, started_at,
+       task_type, sales_script, dialog_scenarios, terminology,
+       typing_min_ms, typing_max_ms, reply_ignore_min_ms, reply_ignore_max_ms,
+       repeat_enabled, repeat_interval_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?)
+  `).run(
+    id, accountId, messageText, intervalMs, JSON.stringify(targets || []), status, createdAt, startedAt ?? null,
+    taskType, salesScript, dialogScenarios, terminology,
+    typingMinMs, typingMaxMs, replyIgnoreMinMs, replyIgnoreMaxMs,
+    repeatEnabled ? 1 : 0, repeatIntervalMs
+  );
   return getBroadcastJob(id);
 }
 

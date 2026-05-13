@@ -44,14 +44,40 @@ function normaliseTargets(input) {
   return out;
 }
 
-export function startBroadcast({ accountId, messageText, targets, intervalMs }) {
+const ALLOWED_TASK_TYPES = new Set(["ping", "cold", "warm"]);
+
+function clampPositive(value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+export function startBroadcast({
+  accountId,
+  messageText,
+  targets,
+  intervalMs,
+  taskType,
+  salesScript,
+  dialogScenarios,
+  terminology,
+  typingMinMs,
+  typingMaxMs,
+  replyIgnoreMinMs,
+  replyIgnoreMaxMs,
+  repeatEnabled,
+  repeatIntervalMs
+}) {
   if (!accountId) throw new BroadcastError("accountId required");
   if (!messageText || !String(messageText).trim()) {
     throw new BroadcastError("messageText required");
   }
-  const interval = Number.isFinite(Number(intervalMs)) && Number(intervalMs) >= 30_000
-    ? Math.floor(Number(intervalMs))
-    : DEFAULT_INTERVAL_MS;
+  const interval = clampPositive(intervalMs, DEFAULT_INTERVAL_MS, 30_000, 24 * 60 * 60 * 1000);
+  const tType = ALLOWED_TASK_TYPES.has(String(taskType || "")) ? String(taskType) : "cold";
+  const typingMin = clampPositive(typingMinMs, 5_000, 0, 60_000);
+  const typingMaxRaw = clampPositive(typingMaxMs, 10_000, typingMin, 60_000);
+  const replyMin = clampPositive(replyIgnoreMinMs, 60_000, 0, 30 * 60 * 1000);
+  const replyMaxRaw = clampPositive(replyIgnoreMaxMs, 120_000, replyMin, 30 * 60 * 1000);
   const norm = normaliseTargets(targets);
   const id = `bc-${randomBytes(8).toString("hex")}`;
   insertBroadcastJob({
@@ -62,7 +88,17 @@ export function startBroadcast({ accountId, messageText, targets, intervalMs }) 
     targets: norm,
     status: "running",
     createdAt: Date.now(),
-    startedAt: Date.now()
+    startedAt: Date.now(),
+    taskType: tType,
+    salesScript: String(salesScript || ""),
+    dialogScenarios: String(dialogScenarios || ""),
+    terminology: String(terminology || ""),
+    typingMinMs: typingMin,
+    typingMaxMs: typingMaxRaw,
+    replyIgnoreMinMs: replyMin,
+    replyIgnoreMaxMs: replyMaxRaw,
+    repeatEnabled: Boolean(repeatEnabled),
+    repeatIntervalMs: clampPositive(repeatIntervalMs, 0, 0, 30 * 24 * 60 * 60 * 1000)
   });
   // Send first one immediately, then schedule the rest at the configured pace.
   schedule(id, 0);
@@ -109,7 +145,10 @@ async function processOne(jobId) {
 
   const updates = { cursor: idx + 1 };
   try {
-    const sendResult = await sendDirectMessage(job.account_id, entry.target, job.message_text);
+    const sendResult = await sendDirectMessage(job.account_id, entry.target, job.message_text, {
+      typingMinMs: job.typing_min_ms,
+      typingMaxMs: job.typing_max_ms
+    });
     entry.status = "sent";
     entry.sentAt = Date.now();
     if (sendResult?.messageId) entry.messageId = sendResult.messageId;

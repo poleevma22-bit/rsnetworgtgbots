@@ -425,7 +425,17 @@ async function handleApi(request, response) {
         accountId: String(body.accountId || ""),
         messageText: String(body.messageText || ""),
         targets: Array.isArray(body.targets) ? body.targets : [],
-        intervalMs: body.intervalMs
+        intervalMs: body.intervalMs,
+        taskType: body.taskType,
+        salesScript: body.salesScript,
+        dialogScenarios: body.dialogScenarios,
+        terminology: body.terminology,
+        typingMinMs: body.typingMinMs,
+        typingMaxMs: body.typingMaxMs,
+        replyIgnoreMinMs: body.replyIgnoreMinMs,
+        replyIgnoreMaxMs: body.replyIgnoreMaxMs,
+        repeatEnabled: body.repeatEnabled,
+        repeatIntervalMs: body.repeatIntervalMs
       });
       sendJson(response, 200, { ok: true, job });
     } catch (e) { reportError(response, e); }
