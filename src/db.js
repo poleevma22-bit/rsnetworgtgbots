@@ -84,7 +84,47 @@ db.exec(`
     session_string  TEXT,                    -- partial after sendCode
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token       TEXT PRIMARY KEY,
+    user_json   TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,            -- epoch ms
+    expires_at  INTEGER NOT NULL             -- epoch ms
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 `);
+
+// --- Sessions (persistent so pm2 restarts don't log everyone out) ---
+
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function getSessionByToken(token) {
+  if (!token) return null;
+  const row = db.prepare("SELECT user_json, expires_at FROM sessions WHERE token = ?").get(token);
+  if (!row) return null;
+  if (row.expires_at < Date.now()) {
+    db.prepare("DELETE FROM sessions WHERE token = ?").run(token);
+    return null;
+  }
+  return safeParse(row.user_json, null);
+}
+
+export function putSession(token, user) {
+  const now = Date.now();
+  db.prepare(
+    "INSERT INTO sessions (token, user_json, created_at, expires_at) VALUES (?, ?, ?, ?)" +
+      " ON CONFLICT(token) DO UPDATE SET user_json=excluded.user_json, expires_at=excluded.expires_at"
+  ).run(token, JSON.stringify(user), now, now + SESSION_TTL_MS);
+}
+
+export function deleteSession(token) {
+  if (!token) return;
+  db.prepare("DELETE FROM sessions WHERE token = ?").run(token);
+}
+
+export function purgeExpiredSessions() {
+  db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now());
+}
 
 // --- Helpers ---
 

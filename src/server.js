@@ -9,7 +9,8 @@ import { store, getSnapshot } from "./data.js";
 import { validateAutomationPolicy } from "./safety.js";
 import {
   insertDatabase, updateAccountSettings, updateLeadComment,
-  listAccounts, getAccount
+  listAccounts, getAccount,
+  getSessionByToken, putSession, deleteSession, purgeExpiredSessions
 } from "./db.js";
 import {
   connectBot, disconnectBot, getWebhookInfo, handleIncomingUpdate,
@@ -37,8 +38,12 @@ const contentTypes = {
   ".png": "image/png"
 };
 
-const sessions = new Map();
+// Sessions are now persisted in SQLite (see db.js sessions table) so that
+// pm2/process restarts don't log every user out. Kept the variable name
+// removed; use getSessionByToken/putSession/deleteSession instead.
 const aiRequestLog = new Map();
+// Garbage-collect expired sessions hourly.
+setInterval(() => { try { purgeExpiredSessions(); } catch {} }, 60 * 60 * 1000).unref?.();
 const demoAdmin = {
   email: "admin@rs.local",
   password: "admin12345"
@@ -122,7 +127,7 @@ function parseCookies(header = "") {
 function getSessionUser(request) {
   const token = parseCookies(request.headers.cookie || "").rs_session;
   if (!token) return null;
-  return sessions.get(token) || null;
+  return getSessionByToken(token);
 }
 
 function checkAiRateLimit(user) {
@@ -249,7 +254,7 @@ async function handleApi(request, response) {
     users.push(user);
     await saveUsers(users);
     const token = randomBytes(32).toString("hex");
-    sessions.set(token, { id: user.id, email: user.email, role: user.role || "user" });
+    putSession(token, { id: user.id, email: user.email, role: user.role || "user" });
     response.setHeader("Set-Cookie", `rs_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`);
     sendJson(response, 201, { ok: true, user: { id: user.id, email: user.email, role: user.role || "user" } });
     return;
@@ -265,7 +270,7 @@ async function handleApi(request, response) {
       return;
     }
     const token = randomBytes(32).toString("hex");
-    sessions.set(token, { id: user.id, email: user.email, role: user.role || "user" });
+    putSession(token, { id: user.id, email: user.email, role: user.role || "user" });
     response.setHeader("Set-Cookie", `rs_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`);
     sendJson(response, 200, { ok: true, user: { id: user.id, email: user.email, role: user.role || "user" } });
     return;
@@ -273,7 +278,7 @@ async function handleApi(request, response) {
 
   if (request.method === "POST" && path === "/api/logout") {
     const token = parseCookies(request.headers.cookie || "").rs_session;
-    if (token) sessions.delete(token);
+    if (token) deleteSession(token);
     response.setHeader("Set-Cookie", "rs_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
     sendJson(response, 200, { ok: true });
     return;
