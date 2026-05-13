@@ -100,7 +100,21 @@ export async function confirmAuth({ tempId, code, password }) {
         return { needsPassword: true };
       }
       try {
-        me = await client.signInWithPassword({ apiId, apiHash }, { password });
+        // gramjs signInWithPassword requires both password and onError to be
+        // async-callable thunks (it invokes them internally during SRP).
+        // Passing a raw string previously broke with
+        //   "2FA failed: authParams.onError is not a function".
+        me = await client.signInWithPassword(
+          { apiId, apiHash },
+          {
+            password: async () => password,
+            onError: async (err) => {
+              console.error("[mtproto] 2FA password flow error:", err?.message || err);
+              // returning true tells gramjs to stop retrying.
+              return true;
+            }
+          }
+        );
       } catch (e2) {
         await client.disconnect().catch(() => {});
         throw new MtprotoError(`2FA failed: ${e2.message}`, 401);
