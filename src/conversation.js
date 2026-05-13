@@ -21,6 +21,7 @@ import {
   getBroadcastJob,
   listBroadcastJobs,
   findOrCreateThread,
+  getGroup,
 } from "./db.js";
 import { sendDirectMessage } from "./telegram-mtproto.js";
 import { generateSalesReply } from "./ai.js";
@@ -73,6 +74,7 @@ async function processThread(thread) {
 
 async function processAiReply(thread) {
   const broadcast = thread.broadcast_id ? getBroadcastJob(thread.broadcast_id) : null;
+  const group = broadcast?.group_id ? getGroup(broadcast.group_id) : null;
   // Pull history and craft the response.
   const history = getThreadHistory(thread.id, 40);
   const { text, model } = await generateSalesReply({
@@ -80,6 +82,7 @@ async function processAiReply(thread) {
     dialogScenarios: broadcast?.dialog_scenarios || "",
     terminology: broadcast?.terminology || "",
     taskType: broadcast?.task_type || "cold",
+    groupPrompt: group?.group_prompt || "",
     firstMessageText: broadcast?.message_text || "",
     history,
   });

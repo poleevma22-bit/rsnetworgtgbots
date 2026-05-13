@@ -1,6 +1,7 @@
 // Persistent storage for accounts/bots/leads.
 // Backed by better-sqlite3 (synchronous; fast enough for our size).
 import Database from "better-sqlite3";
+import { randomBytes } from "node:crypto";
 import { join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
@@ -154,7 +155,29 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_messages_thread
     ON conversation_messages(thread_id, sent_at);
+
+  CREATE TABLE IF NOT EXISTS account_groups (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    group_prompt TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS account_group_members (
+    group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+    position   INTEGER NOT NULL DEFAULT 0,
+    added_at   INTEGER NOT NULL,
+    PRIMARY KEY (group_id, account_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_group_members_group
+    ON account_group_members(group_id, position);
 `);
+
+// Backfill: broadcast_jobs gains an optional group_id pointing at an account_group.
+try { db.exec(`ALTER TABLE broadcast_jobs ADD COLUMN group_id TEXT`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
 
 // --- Migration: backfill v2 columns on existing broadcast_jobs rows. ALTER ADD COLUMN
 // is idempotent if we trap the "duplicate column" error, so this is safe to re-run.
@@ -221,23 +244,28 @@ export function insertBroadcastJob({
   replyIgnoreMinMs = 60000,
   replyIgnoreMaxMs = 120000,
   repeatEnabled = false,
-  repeatIntervalMs = 0
+  repeatIntervalMs = 0,
+  // v3: optional account-group binding for round-robin sends. account_id stays
+  // populated (any one of the group's members) so single-account flows keep
+  // working unchanged.
+  groupId = null
 }) {
   db.prepare(`
     INSERT INTO broadcast_jobs
       (id, account_id, message_text, interval_ms, targets_json, status, created_at, started_at,
        task_type, sales_script, dialog_scenarios, terminology,
        typing_min_ms, typing_max_ms, reply_ignore_min_ms, reply_ignore_max_ms,
-       repeat_enabled, repeat_interval_ms)
+       repeat_enabled, repeat_interval_ms, group_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?,
-            ?, ?)
+            ?, ?, ?)
   `).run(
     id, accountId, messageText, intervalMs, JSON.stringify(targets || []), status, createdAt, startedAt ?? null,
     taskType, salesScript, dialogScenarios, terminology,
     typingMinMs, typingMaxMs, replyIgnoreMinMs, replyIgnoreMaxMs,
-    repeatEnabled ? 1 : 0, repeatIntervalMs
+    repeatEnabled ? 1 : 0, repeatIntervalMs,
+    groupId
   );
   return getBroadcastJob(id);
 }
@@ -647,4 +675,84 @@ export function getThreadHistory(threadId, limit = 40) {
     ORDER BY sent_at ASC, id ASC
     LIMIT ?
   `).all(threadId, limit);
+}
+
+// --- Account groups ---
+
+function genGroupId() {
+  return `grp-${randomBytes(6).toString("hex")}`;
+}
+
+export function createGroup({ name, groupPrompt }) {
+  const id = genGroupId();
+  const now = Date.now();
+  db.prepare(
+    "INSERT INTO account_groups (id, name, group_prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+  ).run(id, String(name || "").trim() || "Безымянная группа", String(groupPrompt || ""), now, now);
+  return getGroup(id);
+}
+
+export function getGroup(id) {
+  return db.prepare("SELECT * FROM account_groups WHERE id = ?").get(id) || null;
+}
+
+export function listGroups() {
+  return db.prepare("SELECT * FROM account_groups ORDER BY created_at ASC").all();
+}
+
+export function updateGroup(id, fields) {
+  const cols = ["updated_at = ?"];
+  const vals = [Date.now()];
+  if (fields.name !== undefined) { cols.push("name = ?"); vals.push(String(fields.name)); }
+  if (fields.groupPrompt !== undefined) { cols.push("group_prompt = ?"); vals.push(String(fields.groupPrompt)); }
+  vals.push(id);
+  db.prepare(`UPDATE account_groups SET ${cols.join(", ")} WHERE id = ?`).run(...vals);
+  return getGroup(id);
+}
+
+export function deleteGroup(id) {
+  db.prepare("DELETE FROM account_groups WHERE id = ?").run(id);
+}
+
+export function addGroupMember(groupId, accountId, position) {
+  const pos = Number.isFinite(position)
+    ? position
+    : (db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM account_group_members WHERE group_id = ?").get(groupId)?.p ?? 0);
+  db.prepare(
+    `INSERT INTO account_group_members (group_id, account_id, position, added_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(group_id, account_id) DO UPDATE SET position = excluded.position`
+  ).run(groupId, accountId, pos, Date.now());
+  return listGroupMembers(groupId);
+}
+
+export function removeGroupMember(groupId, accountId) {
+  db.prepare("DELETE FROM account_group_members WHERE group_id = ? AND account_id = ?")
+    .run(groupId, accountId);
+  return listGroupMembers(groupId);
+}
+
+/**
+ * Returns the ordered list of account rows that belong to a group.
+ * Each row is the bot row from the `bots` table (joined for convenience).
+ */
+export function listGroupMembers(groupId) {
+  return db.prepare(`
+    SELECT b.*, m.position
+    FROM account_group_members m
+    INNER JOIN bots b ON b.id = m.account_id
+    WHERE m.group_id = ?
+    ORDER BY m.position ASC, m.added_at ASC
+  `).all(groupId);
+}
+
+/** Returns just the account ids of the group's MTProto accounts that are connected. */
+export function listGroupConnectedMtprotoAccountIds(groupId) {
+  return db.prepare(`
+    SELECT b.id
+    FROM account_group_members m
+    INNER JOIN bots b ON b.id = m.account_id
+    WHERE m.group_id = ? AND b.kind = 'mtproto' AND b.status = 'connected'
+    ORDER BY m.position ASC, m.added_at ASC
+  `).all(groupId).map((r) => r.id);
 }

@@ -174,9 +174,10 @@ export function setInboundHook(fn) {
  * Phone numbers only work if the recipient is already in the sender's contacts.
  *
  * Options:
- *   typingMinMs / typingMaxMs — emit a "typing…" status to the peer for
- *     a random duration in this range before actually sending the message.
- *     Defaults: 5_000 / 10_000 (5–10 seconds). Pass 0 to skip.
+ *   typingMinMs / typingMaxMs — bounds for the typing-presence emission BEFORE
+ *     the actual send. The exact duration scales with text length (≈70 wpm = ~6
+ *     chars/sec) and is clamped into [typingMinMs, typingMaxMs] plus small jitter.
+ *     Defaults: 5_000 / 10_000. Pass typingMaxMs=0 to skip typing entirely.
  */
 export async function sendDirectMessage(accountId, target, text, options = {}) {
   if (!accountId) throw new MtprotoError("accountId required", 400);
@@ -193,32 +194,45 @@ export async function sendDirectMessage(accountId, target, text, options = {}) {
     throw new MtprotoError(`MTProto client not running for ${accountId}`, 503);
   }
 
-  // Optional "natural-looking" typing simulation before the actual send.
+  // "Natural-looking" typing simulation before the actual send.
+  // Duration is roughly text-length / 6 chars/sec (≈70wpm), clamped into the
+  // configured min/max window, plus 0–500 ms of jitter. Below we re-emit the
+  // typing action every 4 s (Telegram drops it after ~5 s) and occasionally
+  // pause for ~1 s to emulate a human stopping to think.
   const typingMin = Number.isFinite(options.typingMinMs) ? Math.max(0, options.typingMinMs) : 5000;
   const typingMax = Number.isFinite(options.typingMaxMs) ? Math.max(typingMin, options.typingMaxMs) : 10000;
   if (typingMax > 0) {
-    const delay = Math.floor(typingMin + Math.random() * Math.max(1, typingMax - typingMin));
+    const naturalMs = Math.floor((text.length / 6) * 1000);
+    const jitter = Math.floor(Math.random() * 500);
+    const delay = Math.min(typingMax, Math.max(typingMin, naturalMs + jitter));
     try {
       const peer = await client.getInputEntity(cleaned);
-      // Re-emit every 4s — gramjs typing action only persists ~5s on Telegram side.
-      const tickMs = 4000;
+      const TICK_MS = 4000;
       const start = Date.now();
-      const tick = async () => {
+      const tick = async (action) => {
         try {
           await client.invoke(new Api.messages.SetTyping({
             peer,
-            action: new Api.SendMessageTypingAction()
+            action: action ?? new Api.SendMessageTypingAction(),
           }));
         } catch { /* swallow — typing is best-effort */ }
       };
+      // Initial typing pulse.
       await tick();
+      let pauseChance = 0.15; // 15% chance to insert a "thinking" pause per tick
       while (Date.now() - start < delay) {
         const left = delay - (Date.now() - start);
-        await new Promise((r) => setTimeout(r, Math.min(tickMs, left)));
-        if (Date.now() - start < delay) await tick();
+        await new Promise((r) => setTimeout(r, Math.min(TICK_MS, left)));
+        if (Date.now() - start >= delay) break;
+        if (Math.random() < pauseChance) {
+          // Cancel typing for ~600–1200 ms to emulate stopping briefly.
+          await tick(new Api.SendMessageCancelAction());
+          await new Promise((r) => setTimeout(r, 600 + Math.floor(Math.random() * 600)));
+          if (Date.now() - start >= delay) break;
+        }
+        await tick();
       }
     } catch (err) {
-      // Typing errors must NOT block sending. Just log.
       console.warn(`[mtproto] typing simulation failed for @${cleaned}: ${err?.message || err}`);
     }
   }

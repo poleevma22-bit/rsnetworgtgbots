@@ -28,7 +28,9 @@ import {
 } from "./conversation.js";
 import { setInboundHook } from "./telegram-mtproto.js";
 import {
-  listThreadsByBroadcast, getThreadHistory
+  listThreadsByBroadcast, getThreadHistory,
+  createGroup, listGroups, getGroup, updateGroup, deleteGroup,
+  addGroupMember, removeGroupMember, listGroupMembers
 } from "./db.js";
 
 const root = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
@@ -429,7 +431,8 @@ async function handleApi(request, response) {
     const body = await readBody(request);
     try {
       const job = startBroadcast({
-        accountId: String(body.accountId || ""),
+        accountId: body.accountId ? String(body.accountId) : undefined,
+        groupId: body.groupId ? String(body.groupId) : undefined,
         messageText: String(body.messageText || ""),
         targets: Array.isArray(body.targets) ? body.targets : [],
         intervalMs: body.intervalMs,
@@ -466,6 +469,79 @@ async function handleApi(request, response) {
       const job = cancelBroadcast(bcMatch[1]);
       sendJson(response, 200, { ok: true, job });
     } catch (e) { reportError(response, e); }
+    return;
+  }
+
+  // --- Account groups ---
+
+  if (request.method === "GET" && path === "/api/telegram/groups") {
+    const groups = listGroups().map((g) => ({
+      ...g,
+      members: listGroupMembers(g.id).map((m) => ({
+        id: m.id,
+        kind: m.kind,
+        username: m.username,
+        phone: m.phone,
+        status: m.status,
+        position: m.position,
+      })),
+    }));
+    sendJson(response, 200, { ok: true, groups });
+    return;
+  }
+
+  if (request.method === "POST" && path === "/api/telegram/groups") {
+    const body = await readBody(request);
+    try {
+      const group = createGroup({ name: body.name, groupPrompt: body.groupPrompt });
+      sendJson(response, 200, { ok: true, group });
+    } catch (e) { reportError(response, e); }
+    return;
+  }
+
+  const groupMatch = path.match(/^\/api\/telegram\/groups\/([^/]+)$/);
+  if (request.method === "GET" && groupMatch) {
+    const group = getGroup(groupMatch[1]);
+    if (!group) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
+    sendJson(response, 200, {
+      ok: true,
+      group: { ...group, members: listGroupMembers(group.id) },
+    });
+    return;
+  }
+  if (request.method === "PATCH" && groupMatch) {
+    const body = await readBody(request);
+    const group = updateGroup(groupMatch[1], {
+      ...(body.name !== undefined ? { name: body.name } : {}),
+      ...(body.groupPrompt !== undefined ? { groupPrompt: body.groupPrompt } : {}),
+    });
+    if (!group) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
+    sendJson(response, 200, { ok: true, group });
+    return;
+  }
+  if (request.method === "DELETE" && groupMatch) {
+    deleteGroup(groupMatch[1]);
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  // POST /api/telegram/groups/:id/members → { accountId }
+  const groupMembersMatch = path.match(/^\/api\/telegram\/groups\/([^/]+)\/members$/);
+  if (request.method === "POST" && groupMembersMatch) {
+    const body = await readBody(request);
+    const accountId = String(body.accountId || "").trim();
+    if (!accountId) { sendJson(response, 422, { ok: false, error: "accountId required" }); return; }
+    if (!getGroup(groupMembersMatch[1])) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
+    const members = addGroupMember(groupMembersMatch[1], accountId);
+    sendJson(response, 200, { ok: true, members });
+    return;
+  }
+
+  // DELETE /api/telegram/groups/:id/members/:accountId
+  const groupMemberMatch = path.match(/^\/api\/telegram\/groups\/([^/]+)\/members\/([^/]+)$/);
+  if (request.method === "DELETE" && groupMemberMatch) {
+    const members = removeGroupMember(groupMemberMatch[1], groupMemberMatch[2]);
+    sendJson(response, 200, { ok: true, members });
     return;
   }
 

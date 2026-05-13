@@ -11,7 +11,9 @@ import {
   listBroadcastJobs,
   listActiveBroadcastJobs,
   updateBroadcastJob,
-  markBroadcastFinished
+  markBroadcastFinished,
+  listGroupConnectedMtprotoAccountIds,
+  getGroup
 } from "./db.js";
 import { sendDirectMessage } from "./telegram-mtproto.js";
 import { registerOutboundSend } from "./conversation.js";
@@ -55,6 +57,7 @@ function clampPositive(value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) 
 
 export function startBroadcast({
   accountId,
+  groupId,
   messageText,
   targets,
   intervalMs,
@@ -69,7 +72,19 @@ export function startBroadcast({
   repeatEnabled,
   repeatIntervalMs
 }) {
-  if (!accountId) throw new BroadcastError("accountId required");
+  // Either a single MTProto account or a group of them must be supplied. When
+  // a group is supplied we still pin one of its members on the broadcast row
+  // (the first one) so legacy single-account code paths keep working.
+  let resolvedAccountId = accountId;
+  if (groupId) {
+    if (!getGroup(groupId)) throw new BroadcastError("Group not found", 404);
+    const ids = listGroupConnectedMtprotoAccountIds(groupId);
+    if (ids.length === 0) {
+      throw new BroadcastError("Group has no connected MTProto accounts");
+    }
+    resolvedAccountId = ids[0];
+  }
+  if (!resolvedAccountId) throw new BroadcastError("accountId or groupId required");
   if (!messageText || !String(messageText).trim()) {
     throw new BroadcastError("messageText required");
   }
@@ -83,7 +98,8 @@ export function startBroadcast({
   const id = `bc-${randomBytes(8).toString("hex")}`;
   insertBroadcastJob({
     id,
-    accountId,
+    accountId: resolvedAccountId,
+    groupId: groupId || null,
     messageText: String(messageText),
     intervalMs: interval,
     targets: norm,
@@ -145,21 +161,31 @@ async function processOne(jobId) {
   const entry = targets[idx];
 
   const updates = { cursor: idx + 1 };
+  // Pick the sender account: group → round-robin by cursor, else fall back
+  // to the broadcast row's pinned account_id.
+  let senderAccountId = job.account_id;
+  if (job.group_id) {
+    const ids = listGroupConnectedMtprotoAccountIds(job.group_id);
+    if (ids.length > 0) {
+      senderAccountId = ids[idx % ids.length];
+    }
+  }
   try {
-    const sendResult = await sendDirectMessage(job.account_id, entry.target, job.message_text, {
+    const sendResult = await sendDirectMessage(senderAccountId, entry.target, job.message_text, {
       typingMinMs: job.typing_min_ms,
       typingMaxMs: job.typing_max_ms
     });
     entry.status = "sent";
     entry.sentAt = Date.now();
+    entry.senderAccountId = senderAccountId;
     if (sendResult?.messageId) entry.messageId = sendResult.messageId;
     updates.sent_count = job.sent_count + 1;
-    console.log(`[broadcast] ${jobId} sent to @${entry.target} (${idx + 1}/${targets.length})`);
+    console.log(`[broadcast] ${jobId} sent to @${entry.target} via ${senderAccountId} (${idx + 1}/${targets.length})`);
     // Materialise a conversation thread so the worker can attach replies
     // and schedule repeats. Errors here must not block the broadcast.
     try {
       registerOutboundSend({
-        accountId: job.account_id,
+        accountId: senderAccountId,
         broadcastId: job.id,
         targetUsername: entry.target,
         messageText: job.message_text,
