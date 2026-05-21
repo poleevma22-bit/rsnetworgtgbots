@@ -5,6 +5,32 @@
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-4-5";
 
+// Tone-localization constants injected into the system prompt per the resolved
+// conversation language. Spec capability: bot-sales-conversation.
+export const TONE_RU = `Тон: разговорный, тёплый, в стиле Telegram-переписки. Минимум корпоративных слов. 2–3 предложения. Короткие активные глаголы. Без приветствий вроде «Здравствуйте, уважаемый…».`;
+export const TONE_EN = `Tone: short, clean, business casual, international iGaming networking style. 2–3 sentences. Concrete active verbs. No corporate filler like "I hope this message finds you well".`;
+
+// Default cold-opener templates used when broadcast.message_text is empty.
+// Operator-supplied message_text always wins.
+export const DEFAULT_OPENER_RU = `Привет! Я из ConvertAgain.
+
+Мы работаем с retention remarketing для iGaming брендов через Meta, YouTube и DSP traffic.
+
+Подскажите, у вас свой бренд или affiliate трафик?`;
+
+export const DEFAULT_OPENER_EN = `Hi! I'm from ConvertAgain.
+
+We work with iGaming brands on retention remarketing through Meta, YouTube and DSP traffic.
+
+Are you working with your own brand or affiliate traffic?`;
+
+/** Pick the locale-correct default opener; null if `lang` is unknown. */
+export function defaultOpenerFor(lang) {
+  if (lang === "ru") return DEFAULT_OPENER_RU;
+  if (lang === "en") return DEFAULT_OPENER_EN;
+  return null;
+}
+
 // === Built-in safety / scope-lock guard rails ===
 //
 // These rules apply to EVERY generated reply, regardless of broadcast/group
@@ -86,12 +112,12 @@ const GUARD_RAILS = `
 
    Когда MUST-триггер НЕ выполнен и это просто нестандартный вопрос (например «вы откуда команда» или «поддерживаете Tier-3 ГЕО») — тогда можно ответить как продажник в тёплом ключе, без маркера.
 
-9. ЯЗЫК ОБЩЕНИЯ. Веди диалог на языке клиента:
-   – Клиент пишет на русском → ты на русском.
-   – Клиент пишет на английском → ты на английском.
-   – Если первый ответ клиента короткий (1–2 слова) и язык непонятен → ответь сразу на двух языках одной короткой репликой: «Привет! / Hi! Удобнее на русском или English?» После выбора — продолжай только на нём.
-   – Если язык вообще не определяется → пиши на английском.
-   – Никогда не переключай язык внезапно посреди диалога — клиент выбрал, ты следуешь.
+9. ЯЗЫК ОБЩЕНИЯ. Язык диалога определяется системой ДО твоей реплики и передаётся в этом промпте отдельным блоком (см. ниже «=== Язык диалога ===»). Твои правила:
+   – Если в блоке стоит «LOCKED LANGUAGE: ru» — отвечаешь ТОЛЬКО на русском. Если клиент написал на английском — НЕ переключайся, вместо ответа эскалируй маркером [[ESCALATE: client switched language to en mid-thread]] (см. правило 8).
+   – Если стоит «LOCKED LANGUAGE: en» — отвечаешь ТОЛЬКО на английском. Если клиент написал на русском — эскалируй маркером [[ESCALATE: client switched language to ru mid-thread]].
+   – Если стоит «PREFERRED LANGUAGE: …» — это мягкая подсказка от эвристики, пиши на этом языке, но если клиент явно ответит на другом — следуй за клиентом (язык ещё не залочен).
+   – Если стоит «DEFAULT LANGUAGE: en» — отвечай на английском. ЗАПРЕЩЕНО открывать диалог двуязычным приветствием «Привет / Hi» или подобным — это правило заменяет старое поведение.
+   – Никогда не смешивай языки в одном ответе. Никогда не пиши на двух языках одновременно.
 
 9b. БРЕНД КЛИЕНТА. На этапе квалификации старайся выяснить НАЗВАНИЕ бренда клиента (его казино/букмекерская контора) — оно нужно чтобы автоматически сгенерировать персональный оффер. Если клиент не назвал — мягко спроси: «А с каким брендом вы работаете? Это поможет подготовить расчёт под ваши объёмы.» Когда клиент назвал бренд (явно «мы из X», или из контекста очевидно) — продолжай переписку нормально, бренд автоматически попадёт в оффер. Если бренд так и не выяснен к моменту отправки оффера — система подставит «Your Brand» как placeholder.
 
@@ -130,8 +156,46 @@ const GUARD_RAILS = `
    ❌ «Передам коллегам.[[ESCALATE: клиент попросил оффер]][[OFFER_SENT]]» — оба маркера сразу, тоже неправильно.
 `.trim();
 
-function buildSystemPrompt({ salesScript, dialogScenarios, terminology, taskType, groupPrompt, contextNote }) {
+/**
+ * Build the per-language block injected before tone/script. Mode:
+ *   - 'locked'    : `conversation_threads.language` is non-NULL — hard lock, escalate on switch
+ *   - 'preferred' : resolver returned a value from levels 1–4 but not yet persisted — soft
+ *   - 'default'   : only the level-5 default fired — explicit "no bilingual greeting"
+ */
+function buildLanguageBlock({ language, mode }) {
+  const lang = language === "ru" ? "ru" : "en";
+  if (mode === "locked") {
+    const escalateLang = lang === "ru" ? "en" : "ru";
+    return `=== Язык диалога ===
+LOCKED LANGUAGE: ${lang}
+Все ответы в этом диалоге ДОЛЖНЫ быть на ${lang === "ru" ? "русском" : "английском"} языке.
+Если клиент пишет на другом языке — НЕ переключайся; вместо ответа верни короткий handoff и добавь маркер [[ESCALATE: client switched language to ${escalateLang} mid-thread]].`;
+  }
+  if (mode === "preferred") {
+    return `=== Язык диалога ===
+PREFERRED LANGUAGE: ${lang}
+Эвристика подсказывает ${lang === "ru" ? "русский" : "английский"} язык, но язык ещё не залочен. Пиши на этом языке; если клиент явно ответит на другом — следуй за ним.`;
+  }
+  // default
+  return `=== Язык диалога ===
+DEFAULT LANGUAGE: en
+Сигналов для определения языка нет. Пиши на английском. НЕ открывай двуязычным приветствием («Привет / Hi» и подобным) — это запрещено.`;
+}
+
+/**
+ * @param {object} p
+ * @param {'ru'|'en'} [p.language]   resolved or locked language for this tick
+ * @param {boolean}   [p.locked]     true when persisted in conversation_threads.language
+ * @param {boolean}   [p.defaultOnly] true when only the level-5 default fired
+ */
+export function buildSystemPrompt({ salesScript, dialogScenarios, terminology, taskType, groupPrompt, contextNote, language, locked, defaultOnly }) {
   const parts = [GUARD_RAILS, "", `Тип задачи: ${taskType || "cold"} (ping = напоминание, cold = первое касание, warm = прогретый лид).`];
+
+  const mode = locked ? "locked" : defaultOnly ? "default" : "preferred";
+  const blockLang = locked || !defaultOnly ? (language === "ru" ? "ru" : "en") : "en";
+  parts.push(`\n${buildLanguageBlock({ language: blockLang, mode })}`);
+  parts.push(`\n=== Тон ===\n${blockLang === "ru" ? TONE_RU : TONE_EN}`);
+
   if (contextNote?.trim()) {
     parts.push(`\n=== Контекст этого диалога ===\n${contextNote.trim()}`);
   }
@@ -175,13 +239,19 @@ export async function generateSalesReply({
   history,
   firstMessageText,
   contextNote,
+  language,
+  locked,
+  defaultOnly,
 }) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
     throw new Error("OPENROUTER_API_KEY is not set");
   }
 
-  const system = buildSystemPrompt({ salesScript, dialogScenarios, terminology, taskType, groupPrompt, contextNote });
+  const system = buildSystemPrompt({
+    salesScript, dialogScenarios, terminology, taskType, groupPrompt, contextNote,
+    language, locked, defaultOnly,
+  });
 
   // Frame the conversation as user/assistant turns. The first outbound (the
   // broadcast hook) acts as the assistant's opening line.
