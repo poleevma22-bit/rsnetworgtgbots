@@ -51,6 +51,8 @@
       <nav class="nav">
         <button class="active" data-section="analytics" data-icon="analytics" title="Аналитика"><span class="nav-icon"></span><span>Аналитика</span></button>
         <button data-section="settings" data-icon="sales" title="Настройки продаж"><span class="nav-icon"></span><span>Настройки продаж</span></button>
+        <button data-section="templates" data-icon="sales" title="Шаблоны промптов"><span class="nav-icon"></span><span>Шаблоны промптов</span></button>
+        <button data-section="broadcasts" data-icon="sales" title="Рассылки"><span class="nav-icon"></span><span>Рассылки</span></button>
         <button data-section="crm" data-icon="crm" title="CRM"><span class="nav-icon"></span><span>CRM</span></button>
       </nav>
       <small class="nav-note">Opt-in CRM/AI контур. Массовая неразрешенная рассылка не включена.</small>
@@ -102,6 +104,106 @@
         </article>
       </section>
 
+      <section id="templates" class="section" data-title="Шаблоны промптов">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Шаблоны промптов</h2>
+              <span>переменные в виде <code>{{var_name}}</code>; рендер на каждый AI-вызов; привязка к группам аккаунтов</span>
+            </div>
+            <button id="openTemplateModal" class="secondary-button" type="button">+ Новый шаблон</button>
+          </div>
+          <div id="templatesList" class="templates-list"></div>
+          <p class="form-message" id="templatesMessage"></p>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Привязка к группам аккаунтов</h2>
+              <span>группа берёт промпт из шаблона + своих значений переменных; либо falls back на legacy group_prompt</span>
+            </div>
+          </div>
+          <div id="groupsBindList" class="groups-bind-list"></div>
+        </article>
+      </section>
+
+      <section id="broadcasts" class="section" data-title="Рассылки">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Новая рассылка</h2>
+              <span>стартовое сообщение в TG-аккаунт или round-robin по группе; AI-ответы и фоллоу-апы подхватываются автоматически</span>
+            </div>
+          </div>
+          <form id="broadcastForm" class="modal-grid" style="padding:0 18px 18px">
+            <label class="wide-field">Аккаунт или группа
+              <select name="sender" id="broadcastSender" required></select>
+              <small style="color:var(--muted);font-size:11px;">Если выбрана группа — сообщения отправляются round-robin по её членам.</small>
+            </label>
+            <label class="wide-field">Сообщение
+              <textarea name="messageText" id="broadcastMessage" rows="6" placeholder="Привет! Я из ConvertAgain, …" required></textarea>
+            </label>
+            <label class="wide-field">Получатели — по одному в строке (@username или t.me/username)
+              <textarea name="targets" id="broadcastTargets" rows="6" placeholder="@to_be_king&#10;@bkohtakte2oo7&#10;t.me/somebody" required></textarea>
+            </label>
+            <label>Интервал между отправками (сек)
+              <input name="intervalSec" id="broadcastInterval" type="number" min="5" value="60">
+            </label>
+            <label>Тип задачи
+              <select name="taskType" id="broadcastTaskType">
+                <option value="cold">cold (первое касание)</option>
+                <option value="warm">warm (прогретый)</option>
+                <option value="ping">ping (напоминание)</option>
+              </select>
+            </label>
+            <label>Reply-ignore min (сек)
+              <input name="replyMin" id="broadcastReplyMin" type="number" min="5" value="60">
+            </label>
+            <label>Reply-ignore max (сек)
+              <input name="replyMax" id="broadcastReplyMax" type="number" min="5" value="120">
+            </label>
+            <label>Typing min (сек)
+              <input name="typingMin" id="broadcastTypingMin" type="number" min="1" value="5">
+            </label>
+            <label>Typing max (сек)
+              <input name="typingMax" id="broadcastTypingMax" type="number" min="1" value="10">
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" name="repeatEnabled" id="broadcastRepeat">
+              <span>Включить повтор</span>
+            </label>
+            <label>Повтор раз в (дней)
+              <input name="repeatDays" id="broadcastRepeatDays" type="number" min="1" value="7">
+            </label>
+            <button type="submit" style="grid-column:1/-1;justify-self:start;">Запустить рассылку</button>
+            <p class="form-message" id="broadcastMessage_status" style="grid-column:1/-1;"></p>
+          </form>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Активные и завершённые рассылки</h2>
+              <span>50 последних</span>
+            </div>
+            <button id="broadcastsRefresh" class="secondary-button" type="button">Обновить</button>
+          </div>
+          <div id="broadcastsList" class="broadcasts-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Чистка CRM</h2>
+              <span>удалить лиды от анон-ботов и других junk-источников, оставить только живых клиентов</span>
+            </div>
+            <button id="leadsCleanupBtn" class="danger-button" type="button">Удалить junk-лиды</button>
+          </div>
+          <p class="form-message" id="leadsCleanupMsg"></p>
+        </article>
+      </section>
+
       <section id="crm" class="section" data-title="CRM матрица">
         <div class="ai-line panel">
           <form id="summaryForm">
@@ -131,6 +233,139 @@
         <span>support@rs.network</span>
       </footer>
     </main>
+
+    <div class="modal" id="templateModal" hidden>
+      <form class="modal-card modal-card--wide" id="templateForm">
+        <div class="panel-head">
+          <div>
+            <h2 id="templateModalTitle">Новый шаблон промпта</h2>
+            <span>переменные пиши как <code>{{var_name}}</code> — они подставятся из значений группы при AI-вызове</span>
+          </div>
+          <button class="icon-button" id="closeTemplateModal" type="button" aria-label="Закрыть">×</button>
+        </div>
+        <input type="hidden" name="templateId" id="templateFormId">
+        <div class="modal-grid">
+          <label class="wide-field">Название
+            <input name="name" id="templateFormName" placeholder="ConvertAgain — Standard RU" maxlength="120" required>
+          </label>
+          <label class="wide-field">Описание (опц.)
+            <input name="description" id="templateFormDescription" placeholder="Для чего этот шаблон, в каких задачах используется">
+          </label>
+          <label class="wide-field">Тело промпта
+            <textarea name="body" id="templateFormBody" rows="18" placeholder="Ты — менеджер по продажам {{brand_name}}…&#10;Работаем на ТОП ГЕО: {{geo_focus}}.&#10;Главная выгода: {{key_metric}}.&#10;…"></textarea>
+          </label>
+          <div class="wide-field template-vars-detected">
+            <div class="template-vars-label">Найдены переменные:</div>
+            <div id="templateFormVars" class="template-chips"><span class="template-chip muted">— тело пустое —</span></div>
+          </div>
+          <div class="wide-field">
+            <details>
+              <summary>Значения по умолчанию для переменных (опц.)</summary>
+              <div id="templateFormDefaults" class="template-defaults"></div>
+            </details>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="templateFormDelete" class="danger-button" hidden>Удалить</button>
+          <button type="submit">Сохранить шаблон</button>
+        </div>
+        <p class="form-message" id="templateModalMessage"></p>
+      </form>
+    </div>
+
+    <div class="modal" id="bindModal" hidden>
+      <form class="modal-card modal-card--wide" id="bindForm">
+        <div class="panel-head">
+          <div>
+            <h2 id="bindModalTitle">Привязка шаблона к группе</h2>
+            <span>значения переменных применяются только к этой группе; правки самого шаблона тут же подхватятся</span>
+          </div>
+          <button class="icon-button" id="closeBindModal" type="button" aria-label="Закрыть">×</button>
+        </div>
+        <input type="hidden" name="groupId" id="bindFormGroupId">
+        <div class="modal-grid">
+          <label class="wide-field">Шаблон
+            <select name="templateId" id="bindFormTemplate"></select>
+          </label>
+          <label class="wide-field">Telegram @username поддержки для эскалаций
+            <input name="escalationUsername" id="bindFormEscalation" placeholder="без @, например mmmarketng. Пусто = эскалации отключены">
+          </label>
+          <label class="wide-field">База знаний / терминология (склеится в промпт отдельной секцией)
+            <textarea name="knowledgeBase" id="bindFormKb" rows="6" placeholder="Глоссарий, термины, факты о продукте, ответы на типовые тех. вопросы. Появляется в промпте как «=== База знаний / терминология ===»."></textarea>
+          </label>
+          <label class="wide-field">Текст оффера (бот шлёт дословно когда клиент явно готов)
+            <textarea name="offerMessage" id="bindFormOffer" rows="6" placeholder="Готовая презентационная реплика с офером. После отправки лид авто-переедет в CRM-стадию «Оффер отправлен»."></textarea>
+            <small style="color:var(--muted);font-size:11px;">Пусто = оффер-блока в промпте нет.</small>
+          </label>
+          <label class="wide-field">Возражения (custom overrides поверх скрипта)
+            <textarea name="objections" id="bindFormObjections" rows="6" placeholder="Если клиент пишет «дорого» — ответ; если «уже работаем» — ответ. Формат свободный. AI будет следовать этим репликам когда триггер совпадает."></textarea>
+            <small style="color:var(--muted);font-size:11px;">Склеивается в промпт как «=== Возражения и кастомные ответы ===». Полезно для отработки специфичных кейсов без переписывания основного шаблона.</small>
+          </label>
+          <div class="wide-field">
+            <div class="template-vars-label">Прикреплённые файлы к офферу (PNG / JPEG / PDF / PPT / PPTX, до 20 MB)</div>
+            <div id="bindFormAttachments" class="attachments-list"><span class="template-chip muted">— нет файлов —</span></div>
+            <label class="attachment-upload">
+              <input type="file" id="bindFormAttFile" accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.ppt,.pptx,image/png,image/jpeg,image/gif,image/webp,application/pdf,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation">
+              <span class="attachment-upload-label">+ Добавить файл</span>
+            </label>
+            <small style="color:var(--muted);font-size:11px;">Файлы отправляются ботом сразу после оффер-сообщения. Картинки идут inline, PDF/PPTX как документы.</small>
+          </div>
+          <div class="wide-field">
+            <div class="template-vars-label">Значения переменных для этой группы:</div>
+            <div id="bindFormVars" class="template-vars-grid"></div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="bindFormUnbind" class="danger-button">Отвязать шаблон</button>
+          <button type="submit">Сохранить привязку</button>
+        </div>
+        <p class="form-message" id="bindModalMessage"></p>
+      </form>
+    </div>
+
+    <div class="modal" id="stageModal" hidden>
+      <form class="modal-card" id="stageForm">
+        <div class="panel-head">
+          <div>
+            <h2 id="stageModalTitle">Передвинуть лид</h2>
+            <span>Авто-классификация переопределяется ручным выбором. Чтобы вернуться к авто — выбери «— автоматически —».</span>
+          </div>
+          <button class="icon-button" id="closeStageModal" type="button" aria-label="Закрыть">×</button>
+        </div>
+        <input type="hidden" name="threadId" id="stageFormThreadId">
+        <input type="hidden" name="leadId" id="stageFormLeadId">
+        <div class="modal-grid">
+          <div class="wide-field">
+            <div class="template-vars-label">История диалога (последние 30 сообщений)</div>
+            <div id="stageFormHistory" class="dialog-history"><span class="template-chip muted">— пусто —</span></div>
+          </div>
+          <label class="wide-field">Стадия
+            <select name="stageId" id="stageFormStage">
+              <option value="">— автоматически (по триггерам диалога) —</option>
+              <option value="stage-1">Новый контакт</option>
+              <option value="stage-2">Квалификация</option>
+              <option value="stage-3">Презентация</option>
+              <option value="stage-offer">Оффер отправлен</option>
+              <option value="stage-4">Согласование</option>
+              <option value="stage-onboarding">Онбординг</option>
+              <option value="stage-5">Выиграно</option>
+              <option value="stage-hold">Hold</option>
+              <option value="stage-archive">Archive</option>
+            </select>
+          </label>
+          <label class="wide-field">Бренд клиента (используется в PDF-офферах)
+            <input name="clientBrand" id="stageFormClientBrand" placeholder="Например: Boomerang, Spinbetter, Betongame. Пусто = автоподстановка из юзернейма или «Your Brand».">
+          </label>
+          <label class="wide-field">Комментарий
+            <textarea name="comment" id="stageFormComment" rows="3" placeholder="Что произошло, что обсуждали, что дальше"></textarea>
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button type="submit">Сохранить</button>
+        </div>
+        <p class="form-message" id="stageModalMessage"></p>
+      </form>
+    </div>
 
     <div class="modal" id="accountModal" hidden>
       <form class="modal-card" id="accountForm">

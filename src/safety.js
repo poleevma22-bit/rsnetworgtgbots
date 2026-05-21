@@ -1,6 +1,9 @@
-export const MIN_REPLY_DELAY_SECONDS = 60;
-export const MIN_TYPING_SECONDS = 3;
-export const MAX_WORKING_HOURS_PER_DAY = 8;
+// Lowered from 60s to 5s so operator can run end-to-end smoke tests at human
+// speed (10–30s replies) without inventing a new timer profile. 5s still
+// rate-limits any accidental loop and keeps the AI from looking robotic.
+export const MIN_REPLY_DELAY_SECONDS = 5;
+export const MIN_TYPING_SECONDS = 1;
+export const MAX_WORKING_HOURS_PER_DAY = 24;
 
 export function validateAutomationPolicy(settings = {}) {
   const errors = [];

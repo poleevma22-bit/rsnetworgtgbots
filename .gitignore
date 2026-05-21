@@ -5,3 +5,8 @@ node_modules/
 data/tgbots.sqlite3
 data/tgbots.sqlite3-shm
 data/tgbots.sqlite3-wal
+
+# Runtime outputs / backups (added 2026-05-21)
+data/attachments/
+data/offer-output/
+*.bak.*

@@ -242,6 +242,35 @@ export async function sendDirectMessage(accountId, target, text, options = {}) {
   return { messageId: result?.id?.toString() ?? null };
 }
 
+/**
+ * Send a file (image, document, pptx) from disk to a target @username.
+ * Used by the offer-attachment flow — after the AI emits [[OFFER_SENT]] and
+ * the offer text lands, we follow up with each configured file.
+ *
+ * No typing simulation (Telegram shows "uploading" naturally). Passes the
+ * filename through `forceDocument: false` so PNG/JPEG are rendered inline
+ * by Telegram clients and PDFs/PPTX go as documents.
+ */
+export async function sendDirectFile(accountId, target, filePath, options = {}) {
+  if (!accountId) throw new MtprotoError("accountId required", 400);
+  if (!filePath) throw new MtprotoError("filePath required", 400);
+  const cleaned = String(target || "").trim().replace(/^@/, "");
+  if (!cleaned) throw new MtprotoError("Empty target", 400);
+
+  await startWorker(accountId);
+  const client = liveClients.get(accountId);
+  if (!client) throw new MtprotoError(`MTProto client not running for ${accountId}`, 503);
+
+  const isImage = /\.(png|jpe?g|gif|webp)$/i.test(filePath);
+  const result = await client.sendFile(cleaned, {
+    file: filePath,
+    caption: options.caption || "",
+    // Images go inline; PDF/PPTX/everything-else as document.
+    forceDocument: !isImage,
+  });
+  return { messageId: result?.id?.toString() ?? null };
+}
+
 export async function startWorker(id) {
   const cred = getMtprotoSession(id);
   if (!cred?.session_string) return null;

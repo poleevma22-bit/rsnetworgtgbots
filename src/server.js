@@ -30,7 +30,13 @@ import { setInboundHook } from "./telegram-mtproto.js";
 import {
   listThreadsByBroadcast, getThreadHistory,
   createGroup, listGroups, getGroup, updateGroup, deleteGroup,
-  addGroupMember, removeGroupMember, listGroupMembers
+  addGroupMember, removeGroupMember, listGroupMembers,
+  listPromptTemplates, getPromptTemplate, createPromptTemplate,
+  updatePromptTemplate, deletePromptTemplate, bindGroupTemplate,
+  extractTemplateVariables,
+  listGroupAttachments, addGroupAttachment, removeGroupAttachment,
+  setLeadManualStage, syncLeadFromThread,
+  setThreadClientBrand,
 } from "./db.js";
 
 const root = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
@@ -493,7 +499,10 @@ async function handleApi(request, response) {
   if (request.method === "POST" && path === "/api/telegram/groups") {
     const body = await readBody(request);
     try {
-      const group = createGroup({ name: body.name, groupPrompt: body.groupPrompt });
+      let group = createGroup({ name: body.name, groupPrompt: body.groupPrompt });
+      if (body.escalationUsername !== undefined) {
+        group = updateGroup(group.id, { escalationUsername: body.escalationUsername });
+      }
       sendJson(response, 200, { ok: true, group });
     } catch (e) { reportError(response, e); }
     return;
@@ -514,6 +523,10 @@ async function handleApi(request, response) {
     const group = updateGroup(groupMatch[1], {
       ...(body.name !== undefined ? { name: body.name } : {}),
       ...(body.groupPrompt !== undefined ? { groupPrompt: body.groupPrompt } : {}),
+      ...(body.escalationUsername !== undefined ? { escalationUsername: body.escalationUsername } : {}),
+      ...(body.knowledgeBase !== undefined ? { knowledgeBase: body.knowledgeBase } : {}),
+      ...(body.offerMessage !== undefined ? { offerMessage: body.offerMessage } : {}),
+      ...(body.objections !== undefined ? { objections: body.objections } : {}),
     });
     if (!group) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
     sendJson(response, 200, { ok: true, group });
@@ -542,6 +555,179 @@ async function handleApi(request, response) {
   if (request.method === "DELETE" && groupMemberMatch) {
     const members = removeGroupMember(groupMemberMatch[1], groupMemberMatch[2]);
     sendJson(response, 200, { ok: true, members });
+    return;
+  }
+
+  // --- Prompt templates ---
+
+  if (request.method === "GET" && path === "/api/telegram/templates") {
+    sendJson(response, 200, { ok: true, templates: listPromptTemplates() });
+    return;
+  }
+
+  if (request.method === "POST" && path === "/api/telegram/templates") {
+    const body = await readBody(request);
+    if (!String(body.name || "").trim()) { sendJson(response, 422, { ok: false, error: "Введите название шаблона." }); return; }
+    try {
+      const tpl = createPromptTemplate({
+        name: body.name,
+        description: body.description || "",
+        body: body.body || "",
+        defaults: body.defaults || {},
+      });
+      sendJson(response, 200, { ok: true, template: tpl });
+    } catch (e) { reportError(response, e); }
+    return;
+  }
+
+  // POST /api/telegram/templates/preview — extract {{vars}} from a body
+  // without persisting anything. Used by the editor to live-render the chip row.
+  if (request.method === "POST" && path === "/api/telegram/templates/preview") {
+    const body = await readBody(request);
+    const variables = extractTemplateVariables(body.body || "");
+    sendJson(response, 200, { ok: true, variables });
+    return;
+  }
+
+  const templateMatch = path.match(/^\/api\/telegram\/templates\/([^/]+)$/);
+  if (request.method === "GET" && templateMatch) {
+    const tpl = getPromptTemplate(templateMatch[1]);
+    if (!tpl) { sendJson(response, 404, { ok: false, error: "Шаблон не найден" }); return; }
+    sendJson(response, 200, { ok: true, template: tpl });
+    return;
+  }
+  if (request.method === "PATCH" && templateMatch) {
+    const body = await readBody(request);
+    const tpl = updatePromptTemplate(templateMatch[1], {
+      ...(body.name !== undefined ? { name: body.name } : {}),
+      ...(body.description !== undefined ? { description: body.description } : {}),
+      ...(body.body !== undefined ? { body: body.body } : {}),
+      ...(body.defaults !== undefined ? { defaults: body.defaults } : {}),
+    });
+    if (!tpl) { sendJson(response, 404, { ok: false, error: "Шаблон не найден" }); return; }
+    sendJson(response, 200, { ok: true, template: tpl });
+    return;
+  }
+  if (request.method === "DELETE" && templateMatch) {
+    deletePromptTemplate(templateMatch[1]);
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  // POST /api/telegram/groups/:id/template — bind/unbind template + vars.
+  // Body: { templateId: string|null, variables?: { var_name: value, ... } }
+  const groupTemplateMatch = path.match(/^\/api\/telegram\/groups\/([^/]+)\/template$/);
+  if (request.method === "POST" && groupTemplateMatch) {
+    const body = await readBody(request);
+    if (!getGroup(groupTemplateMatch[1])) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
+    if (body.templateId && !getPromptTemplate(body.templateId)) {
+      sendJson(response, 422, { ok: false, error: "templateId не существует" });
+      return;
+    }
+    const group = bindGroupTemplate(groupTemplateMatch[1], {
+      templateId: body.templateId || null,
+      variables: body.variables || {},
+    });
+    sendJson(response, 200, { ok: true, group });
+    return;
+  }
+
+  // --- Offer attachments (PNG/JPEG/PDF/PPTX uploaded via base64-in-JSON) ---
+
+  const groupAttListMatch = path.match(/^\/api\/telegram\/groups\/([^/]+)\/attachments$/);
+  if (request.method === "GET" && groupAttListMatch) {
+    if (!getGroup(groupAttListMatch[1])) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
+    sendJson(response, 200, {
+      ok: true,
+      attachments: listGroupAttachments(groupAttListMatch[1]).map(({ storedPath, ...rest }) => rest),
+    });
+    return;
+  }
+
+  if (request.method === "POST" && groupAttListMatch) {
+    const groupId = groupAttListMatch[1];
+    if (!getGroup(groupId)) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
+    const body = await readBody(request);
+    const filename = String(body.filename || "").trim();
+    const mime = String(body.mime || "application/octet-stream").trim();
+    const contentBase64 = String(body.contentBase64 || "");
+    if (!filename || !contentBase64) {
+      sendJson(response, 422, { ok: false, error: "filename + contentBase64 required" });
+      return;
+    }
+    // Allowlist of mime types the UI advertises.
+    const ALLOWED = /^(image\/(png|jpeg|gif|webp)|application\/(pdf|vnd\.openxmlformats-officedocument\.presentationml\.presentation|vnd\.ms-powerpoint))$/;
+    if (!ALLOWED.test(mime)) {
+      sendJson(response, 422, { ok: false, error: `Mime ${mime} не поддерживается (только PNG/JPEG/GIF/WEBP/PDF/PPT/PPTX)` });
+      return;
+    }
+    const buf = Buffer.from(contentBase64, "base64");
+    if (buf.length > 20 * 1024 * 1024) {
+      sendJson(response, 422, { ok: false, error: "Файл больше 20 MB" });
+      return;
+    }
+    // Store on disk under data/attachments/{groupId}/{ts}-{safeName}.
+    const { mkdirSync: mkdir, writeFileSync } = await import("node:fs");
+    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
+    const dir = join(dataDir, "attachments", groupId);
+    mkdir(dir, { recursive: true });
+    const storedPath = join(dir, `${Date.now()}-${safeName}`);
+    writeFileSync(storedPath, buf);
+    const attachments = addGroupAttachment(groupId, { filename, mime, storedPath, size: buf.length });
+    sendJson(response, 200, { ok: true, attachments: attachments.map(({ storedPath: _sp, ...rest }) => rest) });
+    return;
+  }
+
+  const groupAttItemMatch = path.match(/^\/api\/telegram\/groups\/([^/]+)\/attachments\/([^/]+)$/);
+  if (request.method === "DELETE" && groupAttItemMatch) {
+    const [_, groupId, attId] = groupAttItemMatch;
+    if (!getGroup(groupId)) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
+    const before = listGroupAttachments(groupId).find((a) => a.id === attId);
+    const attachments = removeGroupAttachment(groupId, attId);
+    if (before?.storedPath) {
+      try {
+        const { unlinkSync } = await import("node:fs");
+        unlinkSync(before.storedPath);
+      } catch (err) { console.warn(`[attachment] could not unlink ${before.storedPath}: ${err?.message}`); }
+    }
+    sendJson(response, 200, { ok: true, attachments: attachments.map(({ storedPath: _sp, ...rest }) => rest) });
+    return;
+  }
+
+  // --- Junk-lead cleanup (removes leads with bot-like handles + leads
+  //     not backed by a real conversation_thread) ---
+  if (request.method === "POST" && path === "/api/leads/cleanup") {
+    const { db } = await import("./db.js");
+    const junkLike = `LOWER(telegram_handle) GLOB '*bot' OR ` +
+      `LOWER(telegram_handle) GLOB '@*bot' OR ` +
+      `LOWER(telegram_handle) GLOB '*anonsay*' OR ` +
+      `LOWER(telegram_handle) GLOB '*anonkar*' OR ` +
+      `LOWER(telegram_handle) GLOB '*anonxzx*' OR ` +
+      `LOWER(telegram_handle) GLOB '*ruletkaa*' OR ` +
+      `LOWER(telegram_handle) GLOB '*talkme*' OR ` +
+      `LOWER(telegram_handle) GLOB '*tikible*' OR ` +
+      `LOWER(telegram_handle) GLOB '*ttsave*'`;
+    const r1 = db.prepare(`DELETE FROM leads WHERE ${junkLike}`).run();
+    // Also drop leads not anchored to a thread (legacy demo rows).
+    const r2 = db.prepare(`DELETE FROM leads WHERE chat_id NOT IN (SELECT id FROM conversation_threads)`).run();
+    sendJson(response, 200, { ok: true, removed: { junk: r1.changes, orphan: r2.changes } });
+    return;
+  }
+
+  // --- Manual CRM stage flip (operator override on a lead/thread) ---
+  // POST /api/leads/stage  body: { threadId, stageId, clientBrand? }
+  //   stageId=""     → clear manual override (resume auto-classification)
+  //   clientBrand="" → clear brand (resume auto-infer from username)
+  if (request.method === "POST" && path === "/api/leads/stage") {
+    const body = await readBody(request);
+    const threadId = String(body.threadId || "").trim();
+    const stageId = String(body.stageId || "").trim() || null;
+    if (!threadId) { sendJson(response, 422, { ok: false, error: "threadId required" }); return; }
+    setLeadManualStage(threadId, stageId);
+    if (body.clientBrand !== undefined) {
+      setThreadClientBrand(threadId, String(body.clientBrand).trim() || null);
+    }
+    sendJson(response, 200, { ok: true });
     return;
   }
 
@@ -576,9 +762,23 @@ async function handleApi(request, response) {
     const account = getAccount(body.accountId);
     if (!account) { sendJson(response, 404, { ok: false, error: "Аккаунт не найден" }); return; }
     const timer = resolveTimerProfile(body.timerProfile || account.timerProfile);
+    // Per-account overrides for AI reply latency + typing simulation. Used
+    // to drop Sunsh5151 to a 10s reply window for end-to-end testing
+    // without inventing a new timer profile. If absent → fall back to the
+    // categorical timer profile (legacy behaviour).
+    const explicitReplyDelay = body.replyDelay != null && String(body.replyDelay).trim() !== ""
+      ? Math.max(0, Math.floor(Number(body.replyDelay)))
+      : null;
+    const effectiveReplyDelaySeconds = explicitReplyDelay != null && Number.isFinite(explicitReplyDelay)
+      ? explicitReplyDelay
+      : timer.replyDelaySeconds;
+    const explicitTypingSeconds = body.typingSeconds != null && String(body.typingSeconds).trim() !== ""
+      ? Math.max(0, Math.floor(Number(body.typingSeconds)))
+      : null;
+    const effectiveTypingSeconds = explicitTypingSeconds ?? account.typingSeconds ?? 5;
     const policy = validateAutomationPolicy({
-      replyDelaySeconds: timer.replyDelaySeconds,
-      typingSeconds: 5,
+      replyDelaySeconds: effectiveReplyDelaySeconds,
+      typingSeconds: effectiveTypingSeconds,
       workingHoursPerDay: body.workingHoursPerDay || account.workingHoursPerDay || 6,
       outreachMode: "opt_in"
     });
@@ -587,9 +787,13 @@ async function handleApi(request, response) {
       salesSkill: body.salesSkill || account.salesSkill || "first_contact",
       timerProfile: body.timerProfile || account.timerProfile || "wait_60s",
       promptText: body.promptText ?? account.promptText ?? "",
-      replyDelaySeconds: timer.replyDelaySeconds,
+      replyDelaySeconds: effectiveReplyDelaySeconds,
       repeatIntervalMinutes: timer.repeatIntervalMinutes,
-      typingSeconds: 5,
+      typingSeconds: effectiveTypingSeconds,
+      // aiEnabled defaults to true; only flip when caller passes a value.
+      aiEnabled: body.aiEnabled === undefined
+        ? (account.aiEnabled !== false)
+        : Boolean(body.aiEnabled),
       workingHoursPerDay: Number(body.workingHoursPerDay || account.workingHoursPerDay || 6),
       databaseId: body.databaseId ?? account.databaseId
     });
