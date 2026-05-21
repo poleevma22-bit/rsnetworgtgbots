@@ -215,6 +215,23 @@ catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw 
 try { db.exec(`ALTER TABLE conversation_threads ADD COLUMN client_brand TEXT`); }
 catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
 
+// language: locked conversation language ('ru' | 'en' | NULL). Resolved by
+// detectInboundTextLanguage / detectLeadLanguage / resolveThreadLanguage and
+// persisted by setThreadLanguage on the first non-default signal. Once set,
+// the prompt builder hardcodes this language and conversation.js force-replaces
+// any LLM reply in the opposite script with the locale escalation handoff.
+// SQLite ALTER cannot add CHECK on existing tables; the constraint is
+// enforced in the application layer by setThreadLanguage.
+try { db.exec(`ALTER TABLE conversation_threads ADD COLUMN language TEXT`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+db.exec(`CREATE INDEX IF NOT EXISTS idx_threads_language ON conversation_threads(language)`);
+
+// Mirror the same column onto the CRM `leads` row so admin filters / per-locale
+// reporting can query without joining back to conversation_threads. Populated
+// by syncLeadFromThread from the thread's locked value.
+try { db.exec(`ALTER TABLE leads ADD COLUMN language TEXT`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+
 // Backfill: account_groups gains knowledge_base (terminology + glossary appended
 // to AI prompt), offer_message (operator-defined sales offer text the AI
 // sends verbatim when the client is ready), and offer_attachments_json
@@ -1123,6 +1140,7 @@ export function syncLeadFromThread(threadId) {
         stage_id = @stage_id,
         status = @status,
         messages_json = @messages_json,
+        language = @language,
         last_reply_at = CASE WHEN @last_in > 0 THEN datetime(@last_in/1000, 'unixepoch') ELSE last_reply_at END,
         updated_at = datetime('now')
       WHERE id = @id
@@ -1134,6 +1152,7 @@ export function syncLeadFromThread(threadId) {
       stage_id: stageId,
       status: STAGE_LABEL[stageId] || stageId,
       messages_json: messagesJson,
+      language: thread.language || null,
       last_in: thread.last_inbound_at || 0,
     });
     return existing.id;
@@ -1142,9 +1161,9 @@ export function syncLeadFromThread(threadId) {
   const id = `lead-${thread.id}`;
   db.prepare(`
     INSERT INTO leads
-      (id, account_id, telegram_user_id, telegram_handle, chat_id, stage_id, status, messages_json, last_reply_at)
+      (id, account_id, telegram_user_id, telegram_handle, chat_id, stage_id, status, messages_json, language, last_reply_at)
     VALUES
-      (@id, @account_id, @telegram_user_id, @telegram_handle, @chat_id, @stage_id, @status, @messages_json,
+      (@id, @account_id, @telegram_user_id, @telegram_handle, @chat_id, @stage_id, @status, @messages_json, @language,
        CASE WHEN @last_in > 0 THEN datetime(@last_in/1000, 'unixepoch') ELSE NULL END)
   `).run({
     id,
@@ -1155,6 +1174,7 @@ export function syncLeadFromThread(threadId) {
     stage_id: stageId,
     status: STAGE_LABEL[stageId] || stageId,
     messages_json: messagesJson,
+    language: thread.language || null,
     last_in: thread.last_inbound_at || 0,
   });
   return id;
@@ -1213,26 +1233,150 @@ export function removeGroupAttachment(groupId, attachmentId) {
 // --- Language detection from telegram handle / display name ---
 
 /**
- * Heuristic: 'ru' | 'en' | null. Used as a hint passed to AI on first reply
- * so it picks the language before the client has typed anything substantive.
+ * Per spec `bot-sales-conversation`. Returns `'ru' | 'en' | null`.
  *
- *   - Cyrillic chars anywhere → 'ru'
- *   - Latin handle containing common Russian transliteration patterns → 'ru'
- *   - Otherwise → null (AI follows its own bilingual rule, defaults to EN)
+ * RU signals (evaluated first, stop on match):
+ *   - Cyrillic anywhere in the combined string
+ *   - First-name token matches the extended RU first-name list
+ *   - Surname segment ends in ov/ev/in/sky/skiy/enko
+ *   - Handle contains a CIS geographic marker
+ *
+ * EN signals (only if no RU signal matched):
+ *   - First-name token matches the EN first-name list
+ *   - Combined string is ≥4 chars and pure `[A-Za-z]` (no digits, no underscores)
+ *
+ * Returns `null` when neither set matches — callers should fall through to
+ * lower-priority signals (`detectInboundTextLanguage`, history scan, default).
  */
-const RU_TRANSLIT_PATTERNS = [
-  /ivan|dmit|sergey|sergei|alex|nikolay|nikolai|vlad|yuri|yury|andrey|andrei|maks|maxim|pavel|petr|peter|denis|kirill/i,
-  /smirnov|ivanov|petrov|sokolov|kuznetsov|popov|volkov|fedorov|morozov|orlov|kozlov|novikov|makarov|lebedev/i,
-  /msk|mosc|moskva|spb|piter|kyiv|kiev|minsk|odessa|odesa/i,
-];
 const CYRILLIC_RE = /[Ѐ-ӿ]/;
+const RU_FIRST_NAMES = new Set([
+  "nikolay","nikolai","kolya","sergey","sergei","seryozha","andrey","andrei","vladislav","vlad",
+  "dmitri","dmitry","dima","alexey","alexei","alyosha","ekaterina","katya","alina","maksim","maxim","maks",
+  "ivan","vanya","pavel","pasha","denis","kirill","kostya","konstantin","petr","peter","pyotr",
+  "yuri","yury","yura","anton","tonya","olga","olya","svetlana","sveta","natalia","natasha","tatiana","tanya",
+  "anna","anya","irina","ira","elena","lena",
+]);
+const EN_FIRST_NAMES = new Set([
+  "john","david","mark","kevin","daniel","samantha","michael","mike","chris","brian","james","robert",
+  "william","thomas","paul","matt","matthew","joshua","josh","tyler","ryan","kyle","sean","shawn",
+  "jason","justin","adam","tom","nick","kate",
+]);
+const RU_GEO_TOKENS = new Set([
+  "msk","mosc","moskva","spb","piter","kyiv","kiev","minsk","odessa","odesa",
+]);
+const RU_SURNAME_SUFFIX = /(ov|ev|in|sky|skiy|enko)$/i;
+const PURE_LATIN_HANDLE = /^[A-Za-z]{4,}$/;
+
+/**
+ * Tokenize handle/name on non-letter separators (underscore, dash, digits,
+ * spaces, dots). Word-char `\b` in JS regex treats `_` as a letter, so we
+ * tokenize explicitly to make `nikolay_traffic` and `kate_msk` matchable.
+ */
+function tokenize(s) {
+  return String(s || "")
+    .toLowerCase()
+    .split(/[^a-zа-яё]+/i)
+    .filter((t) => t.length >= 2);
+}
 
 export function detectLeadLanguage({ username, firstName, lastName } = {}) {
   const haystack = [username, firstName, lastName].filter(Boolean).join(" ");
   if (!haystack) return null;
+
+  // RU signal #1: any Cyrillic anywhere.
   if (CYRILLIC_RE.test(haystack)) return "ru";
-  if (RU_TRANSLIT_PATTERNS.some((re) => re.test(haystack))) return "ru";
-  return null; // unknown — let AI defaults handle it
+
+  const tokens = tokenize(haystack);
+
+  // RU signals #2–#4 (RU first-name, RU geo marker, RU surname suffix on a long-enough token).
+  for (const t of tokens) {
+    if (RU_FIRST_NAMES.has(t)) return "ru";
+    if (RU_GEO_TOKENS.has(t)) return "ru";
+    if (t.length >= 5 && RU_SURNAME_SUFFIX.test(t)) return "ru";
+  }
+
+  // EN signals (only if no RU match).
+  for (const t of tokens) {
+    if (EN_FIRST_NAMES.has(t)) return "en";
+  }
+  const handle = String(username || "").replace(/^@/, "");
+  if (handle && PURE_LATIN_HANDLE.test(handle) && !CYRILLIC_RE.test(handle)) return "en";
+
+  return null;
+}
+
+/**
+ * Tiny Unicode-block classifier for inbound client text. Used by the AI worker
+ * as the highest-priority signal in `resolveThreadLanguage`. Returns `null` for
+ * messages too short or with no script-bearing characters; callers fall through.
+ */
+const LATIN_RE = /[A-Za-z]/;
+export function detectInboundTextLanguage(text) {
+  if (!text || typeof text !== "string") return null;
+  if (text.trim().length < 3) return null;
+  // Strip whitespace, punctuation, emoji to avoid `"👍🔥"` registering as a signal.
+  const stripped = text.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}\s\p{P}\p{S}]+/gu, "");
+  if (stripped.length < 3) return null;
+  if (CYRILLIC_RE.test(stripped)) return "ru";
+  if (LATIN_RE.test(stripped)) return "en";
+  return null;
+}
+
+/**
+ * Walk the 5-level priority from the spec and return a definite language.
+ * The result is total — level 5 default = 'en'. The second return value is the
+ * source level (1–5); callers persist via `setThreadLanguage` only when source
+ * is 1–4 (level-5 default is never locked).
+ *
+ *   thread: { target_username, target_telegram_id, target_bio? }
+ *   history: Array<{ direction: 'in'|'out', text: string }>
+ */
+export function resolveThreadLanguage(thread, history = []) {
+  // Level 1: latest inbound text body.
+  const lastInbound = [...history].reverse().find((m) => m.direction === "in" && m.text);
+  if (lastInbound) {
+    const fromText = detectInboundTextLanguage(lastInbound.text);
+    if (fromText) return { language: fromText, source: 1 };
+  }
+
+  // Level 2: handle + first/last name.
+  const fromHandle = detectLeadLanguage({
+    username: thread?.target_username,
+    firstName: thread?.target_first_name,
+    lastName: thread?.target_last_name,
+  });
+  if (fromHandle) return { language: fromHandle, source: 2 };
+
+  // Level 3: bio (if MTProto populated it on the thread row).
+  const bio = thread?.target_bio;
+  if (bio && typeof bio === "string") {
+    if (CYRILLIC_RE.test(bio)) return { language: "ru", source: 3 };
+    if (LATIN_RE.test(bio) && !CYRILLIC_RE.test(bio)) return { language: "en", source: 3 };
+  }
+
+  // Level 4: scan any prior inbound for Cyrillic.
+  for (const m of history) {
+    if (m.direction === "in" && m.text && CYRILLIC_RE.test(m.text)) {
+      return { language: "ru", source: 4 };
+    }
+  }
+
+  // Level 5: default to English (never persisted).
+  return { language: "en", source: 5 };
+}
+
+/**
+ * Persist the locked language on a thread. NO-OP for unknown values — the
+ * application-layer guard for the missing sqlite CHECK constraint (see the
+ * `ALTER TABLE conversation_threads ADD COLUMN language` migration note).
+ * Callers MUST gate this with `source !== 5` so the level-5 default never locks.
+ */
+export function setThreadLanguage(threadId, lang) {
+  if (lang !== "ru" && lang !== "en") return;
+  db.prepare("UPDATE conversation_threads SET language = ?, updated_at = ? WHERE id = ?")
+    .run(lang, Date.now(), threadId);
+  try { syncLeadFromThread(threadId); }
+  catch (err) { console.error(`[db] setThreadLanguage(${threadId}): syncLeadFromThread failed:`, err?.message || err); }
 }
 
 // --- Per-lead client brand (used when rendering offer PDFs) ---
