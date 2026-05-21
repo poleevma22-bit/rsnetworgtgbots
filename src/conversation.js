@@ -32,6 +32,9 @@ import {
   markThreadOfferSent,
   listGroupAttachments,
   detectLeadLanguage,
+  detectInboundTextLanguage,
+  resolveThreadLanguage,
+  setThreadLanguage,
   resolveClientBrand,
 } from "./db.js";
 import { sendDirectFile } from "./telegram-mtproto.js";
@@ -75,6 +78,29 @@ function syncLead(threadId) {
 const REPEAT_PER_CLIENT_FLOOR_MS = 7 * 24 * 60 * 60 * 1000;
 import { sendDirectMessage } from "./telegram-mtproto.js";
 import { generateSalesReply } from "./ai.js";
+
+// Locale-aware handoff text used when the client (or LLM) breaks the locked
+// language. Routed through the standard [[ESCALATE]] marker pipeline.
+const LANGUAGE_SWITCH_HANDOFF = {
+  ru: "Передаю вопрос старшему менеджеру, он скоро напишет вам с точным ответом.",
+  en: "Passing this to our senior manager, they will get back to you shortly.",
+};
+
+/** Did `text` contain any character of the opposite script for `lockedLang`? */
+function containsOppositeScript(text, lockedLang) {
+  if (!text) return false;
+  if (lockedLang === "ru") {
+    // Locked RU: outbound should be Russian. Trigger if the body has Latin-only
+    // chunks and no Cyrillic at all (so brand names "ConvertAgain" don't
+    // false-positive inside an otherwise-Russian reply).
+    return !/[Ѐ-ӿ]/.test(text) && /[A-Za-z]/.test(text);
+  }
+  if (lockedLang === "en") {
+    // Locked EN: any Cyrillic character is a violation.
+    return /[Ѐ-ӿ]/.test(text);
+  }
+  return false;
+}
 
 // Known Telegram junk-bot usernames we've seen DMing managed accounts,
 // plus a generic "ends with bot" check — Telegram requires bot usernames
@@ -263,13 +289,50 @@ async function processAiReply(thread) {
   // bound to a prompt_template (and otherwise returns the legacy
   // group_prompt text). See db.js → resolveGroupPrompt.
   const renderedGroupPrompt = resolveGroupPrompt(group);
-  // Language hint: detect from the client's handle so AI picks the right
-  // language on the very first reply (esp. helpful when client says just
-  // "привет" — too short to language-detect from text alone).
-  const langHint = detectLeadLanguage({ username: thread.target_username });
-  const contextNote = langHint
-    ? `Клиент: @${thread.target_username || thread.target_telegram_id || "unknown"}. Предполагаемый язык клиента: ${langHint === "ru" ? "русский" : "английский"} (по эвристике юзернейма). Веди диалог на этом языке если клиент не указал иное.`
-    : `Клиент: @${thread.target_username || thread.target_telegram_id || "unknown"}. Язык клиента не определён эвристикой — следуй правилу #9.`;
+
+  // --- Language resolution (spec: bot-sales-conversation) ---
+  // Locked value (if any) is the source of truth; otherwise walk the 5-level
+  // priority. Persist non-default signals so the next tick reads the lock.
+  let language = thread.language || null;
+  let locked = Boolean(language);
+  let defaultOnly = false;
+  if (!locked) {
+    const resolved = resolveThreadLanguage(thread, history);
+    language = resolved.language;
+    defaultOnly = resolved.source === 5;
+    if (!defaultOnly) {
+      setThreadLanguage(thread.id, language);
+      thread.language = language;
+      locked = true;
+    }
+  }
+
+  // Belt-and-suspenders #1 (inbound side): if the lock is set AND the latest
+  // inbound client message is in the opposite language, do NOT call the LLM —
+  // emit the locale-correct handoff and escalation marker directly.
+  const lastInbound = [...history].reverse().find((m) => m.direction === "in" && m.text);
+  if (locked && lastInbound) {
+    const inboundLang = detectInboundTextLanguage(lastInbound.text);
+    if (inboundLang && inboundLang !== language) {
+      const handoff = LANGUAGE_SWITCH_HANDOFF[language] || LANGUAGE_SWITCH_HANDOFF.en;
+      const target = thread.target_username || thread.target_telegram_id;
+      if (!target) { clearThreadAction(thread.id); return; }
+      const timing = resolveReplyTiming(account, broadcast);
+      const result = await sendDirectMessage(thread.account_id, target, handoff, {
+        typingMinMs: timing.typingMin,
+        typingMaxMs: timing.typingMax,
+      });
+      appendThreadMessage({ threadId: thread.id, direction: "out", text: handoff, telegramMessageId: result?.messageId });
+      // Reuse the escalation marker extractor to fire the senior-manager DM.
+      const escalateText = `${handoff} [[ESCALATE: client switched language to ${inboundLang} mid-thread]]`;
+      const escalated = extractMarkers(escalateText);
+      if (escalated.escalation.triggered) bumpThreadEscalationCount(thread.id);
+      console.log(`[conversation] ${thread.id} ai-reply skipped — locked=${language}, inbound=${inboundLang} → escalate`);
+      syncLead(thread.id);
+      return;
+    }
+  }
+
   const { text: rawText, model } = await generateSalesReply({
     salesScript: broadcast?.sales_script || "",
     dialogScenarios: broadcast?.dialog_scenarios || "",
@@ -278,18 +341,33 @@ async function processAiReply(thread) {
     groupPrompt: renderedGroupPrompt,
     firstMessageText: broadcast?.message_text || "",
     history,
-    contextNote,
+    language,
+    locked,
+    defaultOnly,
   });
 
   // The AI may emit control markers we strip before sending:
   //   [[ESCALATE: reason]] → hand off to senior manager below
   //   [[OFFER_SENT]]       → CRM flips lead to stage-offer
-  const parsed = extractMarkers(rawText);
-  const text = parsed.clientText || "Передам коллегам, они подключатся.";
+  let parsed = extractMarkers(rawText);
+  let text = parsed.clientText || "Передам коллегам, они подключатся.";
+
+  // Belt-and-suspenders #2 (outbound side): the LLM may have ignored the lock
+  // and produced a reply in the opposite script. Force-replace with the
+  // locale-correct handoff + escalation marker.
+  if (locked && containsOppositeScript(text, language)) {
+    const oppLang = language === "ru" ? "en" : "ru";
+    const handoff = LANGUAGE_SWITCH_HANDOFF[language] || LANGUAGE_SWITCH_HANDOFF.en;
+    const forced = `${handoff} [[ESCALATE: client switched language to ${oppLang} mid-thread]]`;
+    parsed = extractMarkers(forced);
+    text = parsed.clientText || handoff;
+    console.log(`[conversation] ${thread.id} ai-reply force-replaced — LLM emitted ${oppLang} on locked=${language}`);
+  }
+
   const flags = [];
   if (parsed.escalation.triggered) flags.push("ESCALATE");
   if (parsed.offerSent) flags.push("OFFER_SENT");
-  console.log(`[conversation] ${thread.id} ai-reply via ${model}${flags.length ? ` [${flags.join(",")}]` : ""}: ${text.slice(0, 80)}`);
+  console.log(`[conversation] ${thread.id} ai-reply via ${model} [lang=${language}${locked ? ",locked" : defaultOnly ? ",default" : ",pref"}]${flags.length ? ` [${flags.join(",")}]` : ""}: ${text.slice(0, 80)}`);
 
   const target = thread.target_username || thread.target_telegram_id;
   if (!target) {

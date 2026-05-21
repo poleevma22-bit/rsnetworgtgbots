@@ -13,10 +13,12 @@ import {
   updateBroadcastJob,
   markBroadcastFinished,
   listGroupConnectedMtprotoAccountIds,
-  getGroup
+  getGroup,
+  detectLeadLanguage
 } from "./db.js";
 import { sendDirectMessage } from "./telegram-mtproto.js";
 import { registerOutboundSend } from "./conversation.js";
+import { defaultOpenerFor } from "./ai.js";
 
 // jobId -> NodeJS Timer
 const runningTimers = new Map();
@@ -170,8 +172,17 @@ async function processOne(jobId) {
       senderAccountId = ids[idx % ids.length];
     }
   }
+  // Resolve the actual anchor text. Operator-supplied `message_text` always
+  // wins. When it's empty AND the task is a cold opener, fall back to the
+  // locale-correct default opener (spec: bot-sales-conversation).
+  let anchorText = job.message_text;
+  if ((!anchorText || !anchorText.trim()) && (job.task_type === "cold" || !job.task_type)) {
+    const lang = detectLeadLanguage({ username: entry.target }) || "en";
+    anchorText = defaultOpenerFor(lang) || "";
+  }
+
   try {
-    const sendResult = await sendDirectMessage(senderAccountId, entry.target, job.message_text, {
+    const sendResult = await sendDirectMessage(senderAccountId, entry.target, anchorText, {
       typingMinMs: job.typing_min_ms,
       typingMaxMs: job.typing_max_ms
     });
@@ -188,7 +199,7 @@ async function processOne(jobId) {
         accountId: senderAccountId,
         broadcastId: job.id,
         targetUsername: entry.target,
-        messageText: job.message_text,
+        messageText: anchorText,
         messageId: sendResult?.messageId,
         repeatEnabled: Boolean(job.repeat_enabled),
         repeatIntervalMs: Number(job.repeat_interval_ms) || 0,
