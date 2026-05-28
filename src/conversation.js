@@ -36,6 +36,8 @@ import {
   resolveThreadLanguage,
   setThreadLanguage,
   resolveClientBrand,
+  setPipelineNotifyHook,
+  sweepStaleLeads,
 } from "./db.js";
 import { sendDirectFile } from "./telegram-mtproto.js";
 import { spawn } from "node:child_process";
@@ -78,6 +80,16 @@ function syncLead(threadId) {
 const REPEAT_PER_CLIENT_FLOOR_MS = 7 * 24 * 60 * 60 * 1000;
 import { sendDirectMessage } from "./telegram-mtproto.js";
 import { generateSalesReply } from "./ai.js";
+import { lintReply } from "./prompt-linter.js";
+
+// Linter is opt-in via env flag during the initial ramp. Setting
+// PROMPT_LINTER_ENABLED="1" turns it on; anything else is a no-op so the
+// pre-v3 reply path is preserved exactly when disabled.
+const LINTER_ENABLED = process.env.PROMPT_LINTER_ENABLED === "1";
+
+function summarizeFindings(findings) {
+  return findings.map((f) => `${f.type}: ${f.detail}`).join("; ");
+}
 
 // Locale-aware handoff text used when the client (or LLM) breaks the locked
 // language. Routed through the standard [[ESCALATE]] marker pipeline.
@@ -126,6 +138,7 @@ function looksLikeJunkBot(username) {
 // to the AI's own [[ESCALATE]] marker so we catch escalations even when the
 // model misses the cue.
 const ESCALATE_KEYWORDS = [
+  // ask for human
   /позов(и|ите)\s+менеджер/i,
   /живо(й|го|му)\s+(менеджер|человек|оператор)/i,
   /хочу\s+(с\s+)?человек/i,
@@ -134,6 +147,20 @@ const ESCALATE_KEYWORDS = [
   /не\s+бот/i,
   /talk\s+to\s+a?\s*(real\s+)?(human|person|manager)/i,
   /(real|live|human)\s+(person|manager|agent)/i,
+  // call-intent: client wants a call / meeting / demo. Instant-escalate so
+  // senior gets the lead before the AI's 60-120s reply window.
+  /созвон(имся|итесь|нёмся)?/i,
+  /\bпозвони(те|ть)\b/i,
+  /\b(на|в)\s+(созвон|звонок|колл)\b/i,
+  /\bзвон(ок|ка|ки)\b/i,
+  /встреч(а|у|и|айтесь)/i,
+  /\bdemo\b/i,
+  /\bдемо\b/i,
+  /calend(ly|ar)/i,
+  /\bschedule\s+a?\s*(call|meeting|demo)/i,
+  /\bbook\s+a?\s*(call|meeting|demo)/i,
+  /\b(hop|jump|get)\s+on\s+a?\s*call/i,
+  /let'?s\s+(have|do|set\s+up)\s+a?\s*(call|meeting|chat)/i,
 ];
 function inboundAsksForHuman(text) {
   if (!text) return false;
@@ -146,13 +173,25 @@ function inboundAsksForHuman(text) {
 // Both markers are stripped from the text the client sees.
 const ESCALATE_MARKER_RE = /\[\[ESCALATE(?::\s*([^\]]+))?\]\]/i;
 const OFFER_MARKER_RE = /\[\[OFFER_SENT\]\]/i;
+// Runtime sanitizer: strips em-dash (—) and en-dash (–) from anything we
+// send to the client, regardless of what the LLM emitted. Founder explicitly
+// banned both characters across all bot responses. Replaces with a regular
+// hyphen surrounded by spaces, or just removes the dash if it's at a word
+// boundary, so the text reads naturally.
+function stripLongDashes(text) {
+  if (!text) return text;
+  return text
+    .replace(/\s+[—–]\s+/g, ", ")  // "X — Y" → "X, Y"
+    .replace(/[—–]/g, "-");        // anything else → plain hyphen
+}
+
 function extractMarkers(text) {
   const escMatch = text.match(ESCALATE_MARKER_RE);
   const offerMatch = text.match(OFFER_MARKER_RE);
   let clientText = text;
   if (escMatch) clientText = clientText.replace(ESCALATE_MARKER_RE, "");
   if (offerMatch) clientText = clientText.replace(OFFER_MARKER_RE, "");
-  clientText = clientText.trim();
+  clientText = stripLongDashes(clientText).trim();
   return {
     clientText,
     escalation: {
@@ -165,23 +204,40 @@ function extractMarkers(text) {
 
 // Builds the escalation summary that lands in the support operator's DM.
 // Intentionally low-tech — last N messages verbatim. Operator can read fast.
-function formatEscalationDm({ account, thread, reason, history }) {
+function formatEscalationDm({ account, thread, reason, history, kind }) {
   const handle = thread.target_username ? `@${thread.target_username}` : (thread.target_telegram_id || "(unknown)");
   const accountLabel = account?.handle || account?.name || account?.id || "(account)";
-  const recent = (history || []).slice(-10).map((m) => {
+  const recent = (history || []).slice(-8).map((m) => {
     const who = m.direction === "in" ? handle : accountLabel;
     return `${who}: ${String(m.text || "").slice(0, 400)}`;
   }).join("\n");
+  // kind:
+  //   "handoff"   — client ready, your turn (default)
+  //   "progress"  — passive FYI on a funnel-stage transition, no action needed
+  //   "lint-fail" — bot's reply violated the prompt linter twice, take over
+  let header;
+  if (kind === "progress") header = `📬 Лид прогрессирует по воронке`;
+  else if (kind === "lint-fail") header = `⚠️ Бот тормознут линтером, подхвати разговор`;
+  else header = `📨 Лид готов к передаче, можно подключаться`;
+  // Pull out the lint summary from `reason` if it's a lint-fail call. The
+  // reason string is built in conversation.js as:
+  //   `lint-fail: <findings summary> | candidate="..."`
+  let lintLine = null;
+  if (kind === "lint-fail" && typeof reason === "string") {
+    const m = reason.match(/^lint-fail:\s*(.+?)(?:\s*\|\s*candidate=|$)/);
+    if (m) lintLine = `Lint: ${m[1]}`;
+  }
   return [
-    `🚨 Эскалация: бот не справляется или клиент попросил человека`,
+    header,
     `Клиент: ${handle}`,
     `Аккаунт: ${accountLabel}`,
-    `Причина: ${reason}`,
+    lintLine,
+    reason ? `Контекст: ${reason}` : null,
     `Тред: ${thread.id}`,
     ``,
     `Последние сообщения:`,
     recent || "(пусто)",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 /**
@@ -229,7 +285,55 @@ export function startConversationWorker() {
   if (typeof repeatTimer.unref === "function") repeatTimer.unref();
   setTimeout(() => { sweepRepeats().catch(logErr("sweepRepeats")); }, 10_000);
 
-  console.log(`[conversation] worker started (tick=${TICK_MS / 1000}s, repeat-sweep=${REPEAT_TICK_MS / 60_000}min)`);
+  // Register funnel-progression notifier so db.js can DM the senior manager
+  // whenever a lead moves to stage-offer / stage-5.
+  setPipelineNotifyHook(handlePipelineProgress);
+
+  // Stale-lead sweeper: hourly tick auto-flips leads to Hold (>7d no inbound)
+  // or Archive (>30d). Operator overrides via manual_stage_id are respected.
+  const STALE_SWEEP_MS = 60 * 60 * 1000;
+  const staleTimer = setInterval(() => {
+    try { sweepStaleLeads(); }
+    catch (err) { console.error("[conversation] sweepStaleLeads failed:", err?.message || err); }
+  }, STALE_SWEEP_MS);
+  if (typeof staleTimer.unref === "function") staleTimer.unref();
+  // Run once on boot so a fresh process doesn't have to wait an hour for the
+  // first sweep to land on already-stale leads.
+  setTimeout(() => {
+    try { sweepStaleLeads(); }
+    catch (err) { console.error("[conversation] sweepStaleLeads initial failed:", err?.message || err); }
+  }, 30_000);
+
+  console.log(`[conversation] worker started (tick=${TICK_MS / 1000}s, repeat-sweep=${REPEAT_TICK_MS / 60_000}min, stale-sweep=60min)`);
+}
+
+// Sends a passive "📬 Лид прогрессирует" DM to the group's escalation_username
+// when the lead's stage flips to one of the milestone stages. Does NOT change
+// thread state (still 'active') — the AI keeps replying. Pure heads-up so the
+// senior manager can decide whether to jump in.
+const STAGE_TITLES = {
+  "stage-offer": "оффер отправлен",
+  "stage-onboarding": "онбординг начат",
+  "stage-5": "сделка выиграна",
+};
+function handlePipelineProgress({ threadId, accountId, previousStage, stageId }) {
+  const thread = getThread(threadId);
+  if (!thread) return;
+  const group = findGroupForAccount(accountId);
+  if (!group?.escalation_username) return;
+  const account = getAccount(accountId);
+  const history = getThreadHistory(threadId, 40);
+  const stageTitle = STAGE_TITLES[stageId] || stageId;
+  const reasonParts = [`воронка: ${previousStage || "новый"} → ${stageId} (${stageTitle})`];
+  // Fire-and-forget; never throw from inside the DB write path.
+  escalateThread({
+    thread,
+    account,
+    group,
+    reason: reasonParts.join(" | "),
+    history,
+    kind: "progress",
+  }).catch((err) => console.error(`[conversation] pipeline-notify ${threadId} failed:`, err?.message || err));
 }
 
 function logErr(label) {
@@ -333,7 +437,7 @@ async function processAiReply(thread) {
     }
   }
 
-  const { text: rawText, model } = await generateSalesReply({
+  const baseGenArgs = {
     salesScript: broadcast?.sales_script || "",
     dialogScenarios: broadcast?.dialog_scenarios || "",
     terminology: broadcast?.terminology || "",
@@ -344,13 +448,88 @@ async function processAiReply(thread) {
     language,
     locked,
     defaultOnly,
-  });
+  };
+  let { text: rawText, model } = await generateSalesReply(baseGenArgs);
+
+  // Prompt linter — only when explicitly enabled. Catches verbatim repetition
+  // vs the last 3 outbounds and contradictions vs claims in the assembled
+  // system prompt ("мы работаем с Alpha Affiliates" vs "аффилейтам не подойдёт").
+  // On block: retry generation once with an addendum. On double-block: escalate
+  // to senior with kind:"lint-fail" and abort the outbound entirely.
+  let lintFailEscalation = null;
+  if (LINTER_ENABLED) {
+    try {
+      let candidate = extractMarkers(rawText).clientText || rawText;
+      let lintResult = lintReply({
+        reply: candidate,
+        history,
+        assembledPrompt: renderedGroupPrompt,
+      });
+      let blocking = lintResult.findings.filter((f) => f.severity === "block");
+      if (blocking.length > 0) {
+        for (const f of blocking) {
+          console.log(`[lint] ${thread.id} ${f.type}: ${f.detail}`);
+        }
+        const fixupNote = `Перегенерируй ответ. Избегай повторов и противоречий: ${summarizeFindings(blocking)}`;
+        const retryArgs = {
+          ...baseGenArgs,
+          // Append the lint hint to the last history entry as a meta-note so
+          // generateSalesReply surfaces it to the model without changing its
+          // API. If the consumer ignores it, we'll still escalate on retry.
+          history: [
+            ...history,
+            { direction: "out", text: `__LINT_HINT__ ${fixupNote}` },
+          ],
+        };
+        const retry = await generateSalesReply(retryArgs);
+        rawText = retry.text;
+        model = retry.model;
+        candidate = extractMarkers(rawText).clientText || rawText;
+        lintResult = lintReply({
+          reply: candidate,
+          history,
+          assembledPrompt: renderedGroupPrompt,
+        });
+        blocking = lintResult.findings.filter((f) => f.severity === "block");
+        if (blocking.length > 0) {
+          for (const f of blocking) {
+            console.log(`[lint] ${thread.id} ${f.type} (retry-also-failed): ${f.detail}`);
+          }
+          // Stash for the escalation path below — we still emit the markers
+          // pipeline so OFFER_SENT etc. don't get lost, but we won't send.
+          lintFailEscalation = {
+            findings: blocking,
+            originalCandidate: candidate,
+          };
+        }
+      }
+    } catch (err) {
+      console.error(`[lint] ${thread.id} linter crashed (continuing without):`, err?.message || err);
+    }
+  }
 
   // The AI may emit control markers we strip before sending:
   //   [[ESCALATE: reason]] → hand off to senior manager below
   //   [[OFFER_SENT]]       → CRM flips lead to stage-offer
   let parsed = extractMarkers(rawText);
   let text = parsed.clientText || "Передам коллегам, они подключатся.";
+
+  // Lint-fail escalation: don't send candidate to client; DM the senior with
+  // the original problematic text and the findings, so they can take over.
+  if (lintFailEscalation) {
+    bumpThreadEscalationCount(thread.id);
+    await escalateThread({
+      thread,
+      account,
+      group,
+      reason: `lint-fail: ${summarizeFindings(lintFailEscalation.findings)} | candidate="${lintFailEscalation.originalCandidate.slice(0, 200)}"`,
+      history,
+      kind: "lint-fail",
+    }).catch((err) => console.error(`[conversation] ${thread.id} lint-fail escalation crashed:`, err?.message || err));
+    clearThreadAction(thread.id);
+    syncLead(thread.id);
+    return;
+  }
 
   // Belt-and-suspenders #2 (outbound side): the LLM may have ignored the lock
   // and produced a reply in the opposite script. Force-replace with the
@@ -583,6 +762,8 @@ export function handleInboundMessage({ accountId, fromUsername, fromTelegramId, 
     targetUsername: fromUsername || "",
     targetTelegramId: fromTelegramId || "",
   });
+  // Detect ongoing conversation vs brand-new cold inbound (read BEFORE append).
+  const isOngoingThread = getThreadHistory(thread.id, 1).length > 0;
   appendThreadMessage({ threadId: thread.id, direction: "in", text });
   syncLead(thread.id); // flips lead from stage-1 → stage-2 on first inbound
 
@@ -596,8 +777,11 @@ export function handleInboundMessage({ accountId, fromUsername, fromTelegramId, 
     scheduleReply = true;
     group = matchedBroadcast.group_id ? getGroup(matchedBroadcast.group_id) : findGroupForAccount(accountId);
   } else {
+    // No broadcast match: only auto-reply on an ALREADY-ongoing thread. Cold
+    // first-contact strangers are recorded as leads (CRM stage-2) but do NOT
+    // trigger an LLM reply — avoids burning OpenRouter on random/spam DMs.
     group = findGroupForAccount(accountId);
-    if (group?.group_prompt?.trim() && !looksLikeJunkBot(fromUsername)) {
+    if (group?.group_prompt?.trim() && !looksLikeJunkBot(fromUsername) && isOngoingThread) {
       scheduleReply = true;
     }
   }
@@ -638,7 +822,7 @@ export function handleInboundMessage({ accountId, fromUsername, fromTelegramId, 
  * Send the escalation DM to the support handle configured on the group, mark
  * the thread as escalated, and clear pending AI actions.
  */
-async function escalateThread({ thread, account, group, reason, history }) {
+async function escalateThread({ thread, account, group, reason, history, kind }) {
   const target = group?.escalation_username;
   if (!target) {
     console.warn(`[conversation] ${thread.id} escalate requested but group has no escalation_username`);
@@ -649,20 +833,25 @@ async function escalateThread({ thread, account, group, reason, history }) {
   // would miss fresh context. Now every MUST-trigger spawns its own DM.
   // (Cheap; senior reads top message and ignores the rest if redundant.)
 
-  const body = formatEscalationDm({ account, thread, reason, history });
+  const effectiveKind = kind || "handoff";
+  const body = formatEscalationDm({ account, thread, reason, history, kind: effectiveKind });
   try {
     await sendDirectMessage(thread.account_id, target, body, {
       typingMinMs: 800,
       typingMaxMs: 1800,
     });
-    console.log(`[conversation] ${thread.id} escalated to @${target}`);
+    console.log(`[conversation] ${thread.id} ${effectiveKind === "progress" ? "progress-notify" : "escalated"} to @${target}`);
   } catch (err) {
-    console.error(`[conversation] ${thread.id} escalation DM to @${target} failed:`, err?.message || err);
-    return; // don't mark escalated if DM failed — operator never got it
+    console.error(`[conversation] ${thread.id} ${effectiveKind} DM to @${target} failed:`, err?.message || err);
+    return; // don't mutate state if DM failed — operator never got it
   }
-  // Mark thread so AI stops auto-replying. Operator takes over via Sunsh5151
-  // from here. CRM auto-flips to stage-3 (Презентация) because state is now
-  // 'escalated' with escalation_count ≥ 1.
+  // For "progress" notifications we deliberately do NOT change thread state
+  // or clear the AI action — the bot keeps owning the conversation. The DM
+  // is just a passive heads-up to the senior manager.
+  if (effectiveKind === "progress") return;
+  // For "handoff": mark thread so AI stops auto-replying. Operator takes
+  // over via the bot account from here. CRM auto-flips to stage-3
+  // (Презентация) because state is now 'escalated' with escalation_count ≥ 1.
   try { updateThread(thread.id, { state: "escalated" }); } catch {}
   try { clearThreadAction(thread.id); } catch {}
   syncLead(thread.id);

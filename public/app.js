@@ -1,5 +1,6 @@
 let snapshot = null;
 let crmFilter = "all";
+let crmEscalatedOnly = false;
 
 const skills = [
   { id: "first_contact", label: "Первичный контакт" },
@@ -159,15 +160,15 @@ function renderMetrics() {
 function renderAnalyticsTable() {
   document.getElementById("analyticsTable").innerHTML = `
     <div class="row header analytics-row">
-      <span>Account ID</span><span>Статус</span><span>Сообщения</span><span>Replies</span><span>Hold</span><span>Оффер</span><span>Онбординг</span><span>Hot leads</span>
+      <span>Account ID</span><span>Статус</span><span>Сообщения</span><span>Replies</span><span>Hold</span><span>Оффер</span><span>Выиграно</span><span>Hot leads</span>
     </div>
     ${snapshot.accounts.map((account) => {
       const leads = snapshot.leads.filter((lead) => lead.accountId === account.id);
       const replies = leads.filter((lead) => lead.lastReplyAt).length;
       const hold = leads.filter((lead) => lead.stageId === "stage-hold").length;
       const offer = leads.filter((lead) => lead.stageId === "stage-offer").length;
-      const onboarding = leads.filter((lead) => lead.stageId === "stage-onboarding").length;
-      const hot = leads.filter((lead) => ["stage-3", "stage-4", "stage-offer"].includes(lead.stageId)).length;
+      const won = leads.filter((lead) => lead.stageId === "stage-5").length;
+      const hot = leads.filter((lead) => ["stage-3", "stage-offer"].includes(lead.stageId)).length;
       return `
         <div class="row analytics-row">
           <span>${account.id}<small>${escapeHtml(account.name)}</small></span>
@@ -176,7 +177,7 @@ function renderAnalyticsTable() {
           <span>${replies}</span>
           <span>${hold}</span>
           <span>${offer}</span>
-          <span>${onboarding}</span>
+          <span>${won}</span>
           <span>${hot}</span>
         </div>
       `;
@@ -281,18 +282,59 @@ function renderCrmMatrix() {
   const matrix = document.getElementById("crmMatrix");
   const accounts = crmFilter === "all" ? snapshot.accounts : snapshot.accounts.filter((account) => account.id === crmFilter);
   const header = ["Account ID", ...snapshot.stages.map((stage) => stage.title)];
+  // Dedupe leads by (accountId, telegram handle, lowercased): when both the
+  // legacy `upsertLead` path and the modern `syncLeadFromThread` path have
+  // created a row for the same person, the thread-based one wins because it
+  // has accurate stage/escalation info.
+  const dedupedLeads = (() => {
+    const map = new Map();
+    for (const lead of snapshot.leads) {
+      const handleKey = String(lead.telegram || lead.telegramHandle || lead.id).toLowerCase();
+      const key = `${lead.accountId}|${handleKey}`;
+      const prev = map.get(key);
+      // Prefer the lead whose chat_id is a thread id (starts with "th-") —
+      // those are authoritative. Fallback to the most recently updated.
+      const isThreadBacked = String(lead.chatId || "").startsWith("th-");
+      if (!prev) { map.set(key, lead); continue; }
+      const prevIsThreadBacked = String(prev.chatId || "").startsWith("th-");
+      if (isThreadBacked && !prevIsThreadBacked) map.set(key, lead);
+    }
+    return Array.from(map.values());
+  })();
   const rows = accounts.map((account) => {
     const cells = snapshot.stages.map((stage) => {
-      const leads = snapshot.leads.filter((lead) => lead.accountId === account.id && lead.stageId === stage.id);
-      if (!leads.length) return `<div class="crm-cell muted-cell">-</div>`;
+      let leads = dedupedLeads.filter((lead) => lead.accountId === account.id && lead.stageId === stage.id);
+      if (crmEscalatedOnly) {
+        leads = leads.filter((l) => (l.escalationCount || 0) > 0 || l.threadState === "escalated");
+      }
+      // Both empty AND populated cells need data-* so drop-zone wiring works.
+      const cellAttrs = `data-stage-id="${stage.id}" data-account-id="${account.id}"`;
+      if (!leads.length) return `<div class="crm-cell muted-cell drop-zone" ${cellAttrs}>-</div>`;
       return `
-        <div class="crm-cell">
-          ${leads.map((lead) => `
-            <button class="lead-chip ${stage.id === "stage-hold" ? "hold-chip" : ""}" type="button" data-lead-id="${lead.id}" title="${escapeHtml(lead.status)} Комментарий: ${escapeHtml(lead.comment || "нет")}">
-              ${escapeHtml(lead.telegram)}
-              ${lead.nextPingAt ? `<small>ping: ${new Date(lead.nextPingAt).toLocaleDateString("ru-RU")}</small>` : ""}
-            </button>
-          `).join("")}
+        <div class="crm-cell drop-zone" ${cellAttrs}>
+          ${leads.map((lead) => {
+            const escalated = (lead.escalationCount || 0) > 0 || lead.threadState === "escalated";
+            const escNote = escalated
+              ? ` | 🚨 эскалирован старшему (${lead.escalationCount || 1}× , state=${lead.threadState || "?"})`
+              : "";
+            const titleAttr = `${escapeHtml(lead.status)} Комментарий: ${escapeHtml(lead.comment || "нет")}${escapeHtml(escNote)}`;
+            const chipClasses = [
+              "lead-chip",
+              stage.id === "stage-hold" ? "hold-chip" : "",
+              escalated ? "escalated-chip" : "",
+            ].filter(Boolean).join(" ");
+            return `
+              <button class="${chipClasses}" type="button"
+                      draggable="true"
+                      data-lead-id="${lead.id}"
+                      data-thread-id="${escapeHtml(lead.chatId || lead.chat_id || "")}"
+                      data-current-stage="${stage.id}"
+                      title="${titleAttr}">
+                ${escalated ? '<span class="esc-badge" title="Эскалирован старшему">🚨</span> ' : ""}${escapeHtml(lead.telegram)}
+                ${lead.nextPingAt ? `<small>ping: ${new Date(lead.nextPingAt).toLocaleDateString("ru-RU")}</small>` : ""}
+              </button>
+            `;
+          }).join("")}
         </div>
       `;
     }).join("");
@@ -315,8 +357,32 @@ function renderCrmMatrix() {
     ${rows || `<div class="empty-state">По выбранному аккаунту сделок нет.</div>`}
   `;
 
+  // --- Drag-and-drop wiring ---
+  // We track whether the most recent gesture on a chip was a real drag so the
+  // chip's click handler (which opens the stage-edit modal) doesn't fire after
+  // a drag-drop. HTML5 dragend fires BEFORE the synthetic click on the chip,
+  // so a guard flag with a small reset window works reliably.
+  let didDrag = false;
+  const clearDrag = () => { setTimeout(() => { didDrag = false; }, 50); };
+
   matrix.querySelectorAll(".lead-chip").forEach((chip) => {
-    chip.addEventListener("click", async () => {
+    chip.addEventListener("dragstart", (event) => {
+      didDrag = false; // not yet — gets set true on dragend if drop succeeded
+      const payload = {
+        leadId: chip.dataset.leadId,
+        threadId: chip.dataset.threadId,
+        fromStage: chip.dataset.currentStage,
+      };
+      event.dataTransfer.setData("application/json", JSON.stringify(payload));
+      event.dataTransfer.effectAllowed = "move";
+      chip.classList.add("dragging");
+    });
+    chip.addEventListener("dragend", () => {
+      chip.classList.remove("dragging");
+      clearDrag();
+    });
+    chip.addEventListener("click", async (event) => {
+      if (didDrag) { event.preventDefault(); event.stopPropagation(); didDrag = false; return; }
       const lead = snapshot.leads.find((item) => item.id === chip.dataset.leadId);
       if (!lead) return;
       // If the templates-module exposes the stage modal (Wave 3), use it —
@@ -333,6 +399,40 @@ function renderCrmMatrix() {
         body: JSON.stringify({ leadId: lead.id, comment })
       });
       await refresh();
+    });
+  });
+
+  matrix.querySelectorAll(".drop-zone").forEach((zone) => {
+    zone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      zone.classList.add("drop-target");
+    });
+    zone.addEventListener("dragleave", () => { zone.classList.remove("drop-target"); });
+    zone.addEventListener("drop", async (event) => {
+      event.preventDefault();
+      zone.classList.remove("drop-target");
+      didDrag = true;
+      let payload;
+      try { payload = JSON.parse(event.dataTransfer.getData("application/json") || "{}"); }
+      catch { payload = {}; }
+      const toStage = zone.dataset.stageId;
+      if (!payload.threadId || !toStage) return;
+      if (payload.fromStage === toStage) return;
+      // Optimistic: nudge the chip visually pending refresh.
+      zone.style.opacity = "0.5";
+      try {
+        await api("/api/leads/stage", {
+          method: "POST",
+          body: JSON.stringify({ threadId: payload.threadId, stageId: toStage }),
+        });
+      } catch (err) {
+        console.error("[crm] stage flip failed:", err);
+        alert("Не удалось перенести лид: " + (err?.message || err));
+      } finally {
+        zone.style.opacity = "";
+        await refresh();
+      }
     });
   });
 }
@@ -370,6 +470,16 @@ document.getElementById("crmAccountFilter").addEventListener("change", (event) =
   crmFilter = event.currentTarget.value;
   renderCrmMatrix();
 });
+
+// Optional checkbox in the CRM legend. Defensive — element may not exist
+// on older deployments served before the index.html update lands.
+const crmEscalatedToggle = document.getElementById("crmEscalatedOnly");
+if (crmEscalatedToggle) {
+  crmEscalatedToggle.addEventListener("change", (event) => {
+    crmEscalatedOnly = Boolean(event.currentTarget.checked);
+    renderCrmMatrix();
+  });
+}
 
 document.getElementById("modalSkill").addEventListener("change", (event) => {
   document.getElementById("modalTimer").innerHTML = timerRows(event.currentTarget.value, "");

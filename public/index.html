@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>RS Network CRM</title>
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/styles.css?v=20260524-3">
   </head>
   <body class="auth-locked">
     <section class="auth-screen" id="authScreen">
@@ -218,8 +218,12 @@
           <div class="panel-head">
             <div>
               <h2>Аккаунты x этапы продаж</h2>
-              <span>Hold: пинг раз в месяц; Archive: закрытые и замороженные сделки</span>
+              <span>🚨 = эскалирован старшему (на любом этапе). Auto-Hold: нет ответа &gt; 7 дней. Auto-Archive: нет ответа &gt; 30 дней. Можно перетаскивать чипы между этапами.</span>
             </div>
+            <label class="compact-select" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+              <input type="checkbox" id="crmEscalatedOnly" style="margin:0;">
+              Только эскалированные
+            </label>
             <label class="compact-select">Фильтр аккаунта<select id="crmAccountFilter"></select></label>
           </div>
           <div id="crmMatrix" class="crm-matrix"></div>
@@ -346,8 +350,6 @@
               <option value="stage-2">Квалификация</option>
               <option value="stage-3">Презентация</option>
               <option value="stage-offer">Оффер отправлен</option>
-              <option value="stage-4">Согласование</option>
-              <option value="stage-onboarding">Онбординг</option>
               <option value="stage-5">Выиграно</option>
               <option value="stage-hold">Hold</option>
               <option value="stage-archive">Archive</option>
@@ -410,6 +412,6 @@
       </div>
     </aside>
 
-    <script src="/app.js" type="module"></script>
+    <script src="/app.js?v=20260524-3" type="module"></script>
   </body>
 </html>

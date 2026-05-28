@@ -288,6 +288,13 @@ export async function startWorker(id) {
     try {
       const msg = event.message;
       if (!msg || msg.out) return;
+      // Sales bot operates ONLY in 1:1 private chats. Ignore groups, supergroups
+      // and channels — that is where ads and public-channel chatter live, and it
+      // was triggering OpenRouter on every message. PeerUser = private DM.
+      if (msg.peerId?.className !== "PeerUser") {
+        console.log(`[mtproto] ${id} inbound in non-private chat (${msg.peerId?.className}), skipping`);
+        return;
+      }
       // Skip empty / non-text payloads (stickers without text, photos with no caption, etc.).
       const text = (typeof msg.message === "string" && msg.message.trim()) ? msg.message : "";
       if (!text) {
@@ -300,12 +307,31 @@ export async function startWorker(id) {
       const chatId = peer?.userId?.toString() || peer?.chatId?.toString() || peer?.channelId?.toString() || senderId;
       let handle = "";
       let usernameOnly = "";
+      let senderIsBot = false;
+      let firstNameOnly = "";
       try {
         const sender = await msg.getSender();
         usernameOnly = sender?.username ? String(sender.username).toLowerCase() : "";
-        handle = sender?.username ? `@${sender.username}` : (sender?.firstName || "");
+        firstNameOnly = sender?.firstName ? String(sender.firstName) : "";
+        handle = sender?.username ? `@${sender.username}` : firstNameOnly;
+        // Telegram User objects carry a `bot` boolean. Forwarder/notification
+        // bots (anonymous-message bots, ruletkaa, etc.) come in as bot=true
+        // and have no username we want to engage with.
+        senderIsBot = Boolean(sender?.bot);
       } catch (e) {
         console.warn(`[mtproto] ${id} getSender failed: ${e?.message || e}`);
+      }
+      // Hard filter: never engage with other bots. Telegram-bot inbounds are
+      // either ads, anonymous-message forwarders, or notification spam. We
+      // also bail when there's no @username AND no first_name (truly empty
+      // sender, e.g. a deleted account or a channel post).
+      if (senderIsBot) {
+        console.log(`[mtproto] ${id} inbound from bot-sender (handle=${handle || "(none)"}), skipping`);
+        return;
+      }
+      if (!usernameOnly && !firstNameOnly) {
+        console.log(`[mtproto] ${id} inbound from empty-sender, skipping`);
+        return;
       }
       console.log(`[mtproto] ${id} inbound from senderId=${senderId} username=${usernameOnly || "(none)"} text="${text.slice(0, 80)}"`);
 

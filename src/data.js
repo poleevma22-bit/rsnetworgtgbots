@@ -9,8 +9,6 @@ export const stages = [
   { id: "stage-2", title: "Квалификация", color: "#0f766e" },
   { id: "stage-3", title: "Презентация", color: "#7c3aed" },
   { id: "stage-offer", title: "Оффер отправлен", color: "#2563eb" },
-  { id: "stage-4", title: "Согласование", color: "#b45309" },
-  { id: "stage-onboarding", title: "Онбординг", color: "#15803d" },
   { id: "stage-5", title: "Выиграно", color: "#15803d" },
   { id: "stage-hold", title: "Hold", color: "#71717a" },
   { id: "stage-archive", title: "Archive", color: "#525252" }
@@ -69,7 +67,7 @@ export function getSnapshot() {
 
   const hold = leads.filter((l) => l.stageId === "stage-hold").length;
   const offer = leads.filter((l) => l.stageId === "stage-offer").length;
-  const onboarding = leads.filter((l) => l.stageId === "stage-onboarding").length;
+  const won = leads.filter((l) => l.stageId === "stage-5").length;
 
   return {
     accounts,
@@ -87,7 +85,7 @@ export function getSnapshot() {
       ignored: leads.filter((l) => !l.lastReplyAt).length,
       hold,
       offer,
-      onboarding,
+      won,
       archived: leads.filter((l) => l.stageId === "stage-archive").length,
       accountsInWork: accounts.length,
       connectedAccounts: accounts.filter((a) => a.status === "connected").length,

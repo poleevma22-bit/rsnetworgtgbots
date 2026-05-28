@@ -37,7 +37,16 @@ import {
   listGroupAttachments, addGroupAttachment, removeGroupAttachment,
   setLeadManualStage, syncLeadFromThread,
   setThreadClientBrand,
+  resolveGroupPromptWithBreakdown,
+  resolveGroupPrompt,
+  countMessagesByDirection, countMessagesContaining, countOfferSentThreads,
+  getMtprotoAccountsWithSessionAge,
+  createTestThread, appendThreadMessage,
+  resolveThreadLanguage,
 } from "./db.js";
+import { execSync } from "node:child_process";
+import { lintReply } from "./prompt-linter.js";
+import { generateSalesReply } from "./ai.js";
 
 const root = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
 const publicDir = join(root, "public");
@@ -499,9 +508,25 @@ async function handleApi(request, response) {
   if (request.method === "POST" && path === "/api/telegram/groups") {
     const body = await readBody(request);
     try {
-      let group = createGroup({ name: body.name, groupPrompt: body.groupPrompt });
-      if (body.escalationUsername !== undefined) {
-        group = updateGroup(group.id, { escalationUsername: body.escalationUsername });
+      let group = createGroup({
+        name: body.name,
+        groupPrompt: body.groupPrompt,
+        salesPersona: body.salesPersona,
+        productPitch: body.productPitch,
+        technicalPrompt: body.technicalPrompt,
+        qualificationQuestions: body.qualificationQuestions,
+      });
+      // Settings that aren't part of createGroup's signature (escalation,
+      // offer, etc.) flow through the same update path.
+      const followups = {
+        ...(body.escalationUsername !== undefined ? { escalationUsername: body.escalationUsername } : {}),
+        ...(body.knowledgeBase !== undefined ? { knowledgeBase: body.knowledgeBase } : {}),
+        ...(body.offerMessage !== undefined ? { offerMessage: body.offerMessage } : {}),
+        ...(body.objections !== undefined ? { objections: body.objections } : {}),
+        ...(body.offerLink !== undefined ? { offerLink: body.offerLink } : {}),
+      };
+      if (Object.keys(followups).length > 0) {
+        group = updateGroup(group.id, followups);
       }
       sendJson(response, 200, { ok: true, group });
     } catch (e) { reportError(response, e); }
@@ -527,9 +552,25 @@ async function handleApi(request, response) {
       ...(body.knowledgeBase !== undefined ? { knowledgeBase: body.knowledgeBase } : {}),
       ...(body.offerMessage !== undefined ? { offerMessage: body.offerMessage } : {}),
       ...(body.objections !== undefined ? { objections: body.objections } : {}),
+      ...(body.offerLink !== undefined ? { offerLink: body.offerLink } : {}),
+      ...(body.salesPersona !== undefined ? { salesPersona: body.salesPersona } : {}),
+      ...(body.productPitch !== undefined ? { productPitch: body.productPitch } : {}),
+      ...(body.technicalPrompt !== undefined ? { technicalPrompt: body.technicalPrompt } : {}),
+      ...(body.qualificationQuestions !== undefined ? { qualificationQuestions: body.qualificationQuestions } : {}),
     });
     if (!group) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
     sendJson(response, 200, { ok: true, group });
+    return;
+  }
+
+  // POST /api/groups/:id/preview → { assembled, sections } — used by the
+  // admin "Собранный системный промпт" preview panel.
+  const groupPreviewMatch = path.match(/^\/api\/groups\/([^/]+)\/preview$/);
+  if (request.method === "POST" && groupPreviewMatch) {
+    const group = getGroup(groupPreviewMatch[1]);
+    if (!group) { sendJson(response, 404, { ok: false, error: "Group not found" }); return; }
+    const { assembled, sections } = resolveGroupPromptWithBreakdown(group);
+    sendJson(response, 200, { ok: true, assembled, sections });
     return;
   }
   if (request.method === "DELETE" && groupMatch) {
@@ -873,6 +914,39 @@ async function handleApi(request, response) {
     return;
   }
 
+  // GET /api/health/snapshot → operational overview for the admin dashboard.
+  if (request.method === "GET" && path === "/api/health/snapshot") {
+    try {
+      const snap = await buildHealthSnapshot();
+      sendJson(response, 200, snap);
+    } catch (e) { reportError(response, e); }
+    return;
+  }
+
+  // POST /api/health/check → active liveness probe (SQLite + mtproto + OpenRouter).
+  if (request.method === "POST" && path === "/api/health/check") {
+    try {
+      const result = await runHealthCheck();
+      sendJson(response, 200, result);
+    } catch (e) { reportError(response, e); }
+    return;
+  }
+
+  // POST /api/playground/run → run a hypothetical inbound through the full
+  // reply pipeline without touching real Telegram.
+  if (request.method === "POST" && path === "/api/playground/run") {
+    const body = await readBody(request);
+    try {
+      const result = await runPlayground({
+        groupId: String(body.groupId || "").trim(),
+        accountId: String(body.accountId || "").trim(),
+        inboundText: String(body.inboundText || "").trim(),
+      });
+      sendJson(response, result.status, result.payload);
+    } catch (e) { reportError(response, e); }
+    return;
+  }
+
   sendJson(response, 404, { ok: false, error: "API endpoint not found" });
 }
 
@@ -889,12 +963,234 @@ async function handleStatic(request, response) {
 
   try {
     const file = await readFile(safePath);
-    response.writeHead(200, { "content-type": contentTypes[extname(safePath)] || "application/octet-stream" });
+    const ext = extname(safePath);
+    const headers = { "content-type": contentTypes[ext] || "application/octet-stream" };
+    // index.html (or any directly-served HTML) must always be fresh so the
+    // page never points at stale `app.js?v=...` references. JS/CSS get long
+    // cache since they're versioned via ?v=YYYYMMDD-N query string.
+    if (ext === ".html" || pathname === "/" || pathname === "/index.html") {
+      headers["cache-control"] = "no-store, must-revalidate";
+      headers.pragma = "no-cache";
+      headers.expires = "0";
+    } else if (ext === ".js" || ext === ".css") {
+      headers["cache-control"] = "public, max-age=300";
+    }
+    response.writeHead(200, headers);
     response.end(file);
   } catch {
     response.writeHead(404);
     response.end("Not found");
   }
+}
+
+// --- Health snapshot + checks ---
+
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+function readPm2Tail(lines = 50) {
+  // Defensive: pm2 might not be on PATH for the user the bot runs as, and
+  // the log file format may change. Catch everything; return [] on failure.
+  try {
+    const raw = execSync(`pm2 logs tg-bots --nostream --lines ${lines} --raw 2>&1`, {
+      encoding: "utf8",
+      timeout: 4000,
+      maxBuffer: 1024 * 1024,
+    });
+    // Reverse so newest is at top. Trim noise lines (pm2 banner) by skipping
+    // empty lines and the "/root/.pm2/logs/..." headers.
+    return raw.split("\n")
+      .filter((l) => l && !l.startsWith("/root/.pm2/logs/") && !l.startsWith("[PM2]"))
+      .slice(-lines)
+      .reverse()
+      .map((text) => {
+        let level = "info";
+        if (/error|fail|crash|❌/i.test(text)) level = "error";
+        else if (/warn|⚠️/i.test(text)) level = "warn";
+        // Approximate timestamp from current time — pm2 raw output doesn't
+        // reliably timestamp lines, so we punt and let the UI display "now".
+        return { ts: new Date().toISOString(), level, text };
+      });
+  } catch {
+    return null; // signal failure to caller
+  }
+}
+
+async function buildHealthSnapshot() {
+  const nowMs = Date.now();
+  const since = nowMs - ONE_DAY_MS;
+
+  const accounts = getMtprotoAccountsWithSessionAge();
+
+  const inbound24h = countMessagesByDirection({ sinceMs: since, direction: "in" });
+  const outbound24h = countMessagesByDirection({ sinceMs: since, direction: "out" });
+  const escalations24h = countMessagesContaining({ sinceMs: since, needle: "[[ESCALATE", direction: "out" });
+  const offerSent24h = countOfferSentThreads({ sinceMs: since });
+
+  let lintRepetition = 0, lintContradiction = 0, openrouterErrors = 0;
+  const tailMaybe = readPm2Tail(200); // wider scan for counter aggregation
+  if (tailMaybe) {
+    for (const entry of tailMaybe) {
+      if (entry.text.includes("[lint]")) {
+        if (entry.text.includes("repetition")) lintRepetition += 1;
+        if (entry.text.includes("contradiction")) lintContradiction += 1;
+      }
+      if (/OpenRouter\s+(40\d|5\d\d|returned empty)/i.test(entry.text)) {
+        openrouterErrors += 1;
+      }
+    }
+  }
+
+  const tail = tailMaybe ? tailMaybe.slice(0, 50) : [];
+
+  const alerts = [];
+  for (const acct of accounts) {
+    if (acct.session_age_days > 25) {
+      alerts.push({
+        severity: "warn",
+        message: `Сессия @${acct.username || acct.id} истекает через ~${Math.max(1, 30 - acct.session_age_days)} дн.`,
+      });
+    }
+    if (acct.health === "limited" || acct.health === "down") {
+      alerts.push({
+        severity: "critical",
+        message: `Аккаунт @${acct.username || acct.id} в состоянии ${acct.health}`,
+      });
+    }
+  }
+  if (openrouterErrors > 0) {
+    alerts.push({
+      severity: "critical",
+      message: `OpenRouter вернул ${openrouterErrors} ошибок за 24ч, проверь ключ и лимиты`,
+    });
+  }
+  // Zero-escalations during business hours (MSK 09:00-18:00, Mon-Fri).
+  const nowMsk = new Date(nowMs + 3 * 60 * 60 * 1000); // UTC → MSK
+  const hour = nowMsk.getUTCHours();
+  const dow = nowMsk.getUTCDay(); // 0=Sun
+  const inBusinessHours = dow >= 1 && dow <= 5 && hour >= 9 && hour < 18;
+  if (inBusinessHours && escalations24h === 0 && inbound24h > 5) {
+    alerts.push({
+      severity: "warn",
+      message: `За день ${inbound24h} входящих, ноль эскалаций, проверь промпт`,
+    });
+  }
+  if (!tailMaybe) {
+    alerts.push({ severity: "warn", message: "Log tail unavailable" });
+  }
+  alerts.sort((a, b) => (a.severity === "critical" ? -1 : 1) - (b.severity === "critical" ? -1 : 1));
+
+  return {
+    accounts,
+    counters_24h: {
+      inbound: inbound24h,
+      outbound: outbound24h,
+      escalations: escalations24h,
+      offer_sent: offerSent24h,
+      lint_findings: { repetition: lintRepetition, contradiction: lintContradiction },
+      openrouter_errors: openrouterErrors,
+    },
+    tail,
+    alerts,
+  };
+}
+
+async function runHealthCheck() {
+  const checks = [];
+  // 1. SQLite
+  const t1 = Date.now();
+  try {
+    // Cheap query through an existing exported path.
+    listGroups();
+    checks.push({ name: "sqlite", ok: true, ms: Date.now() - t1 });
+  } catch (e) {
+    checks.push({ name: "sqlite", ok: false, ms: Date.now() - t1, error: e?.message || String(e) });
+  }
+  // 2. Each mtproto session (probe via the existing mtproto module; we don't
+  // have a direct authorization probe exposed, so we approximate by checking
+  // the bot row's health was recently 'ok'.)
+  for (const acct of getMtprotoAccountsWithSessionAge()) {
+    checks.push({
+      name: `mtproto:${acct.id}`,
+      ok: acct.health === "ok",
+      ms: 0,
+      ...(acct.health === "ok" ? {} : { error: `health=${acct.health}` }),
+    });
+  }
+  // 3. OpenRouter tiny test
+  const t3 = Date.now();
+  try {
+    const apiKey = process.env.OPENROUTER_API_KEY || "";
+    if (!apiKey) {
+      checks.push({ name: "openrouter", ok: false, ms: 0, error: "OPENROUTER_API_KEY not set" });
+    } else {
+      const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "openai/gpt-4o-mini",
+          messages: [{ role: "user", content: "ping" }],
+          max_tokens: 5,
+        }),
+      });
+      if (resp.ok) {
+        checks.push({ name: "openrouter", ok: true, ms: Date.now() - t3 });
+      } else {
+        const txt = await resp.text().catch(() => "");
+        checks.push({
+          name: "openrouter", ok: false, ms: Date.now() - t3,
+          error: `HTTP ${resp.status}: ${txt.slice(0, 120)}`,
+        });
+      }
+    }
+  } catch (e) {
+    checks.push({ name: "openrouter", ok: false, ms: Date.now() - t3, error: e?.message || String(e) });
+  }
+  const failed = checks.filter((c) => !c.ok).length;
+  return {
+    ok: failed === 0,
+    checks,
+    summary: failed === 0 ? "All checks passed" : `${failed} of ${checks.length} checks failed`,
+  };
+}
+
+// --- Playground ---
+
+async function runPlayground({ groupId, accountId, inboundText }) {
+  if (!accountId) return { status: 400, payload: { ok: false, error: "Account not found" } };
+  const account = getAccount(accountId);
+  if (!account) return { status: 400, payload: { ok: false, error: "Account not found" } };
+  if (!groupId) return { status: 400, payload: { ok: false, error: "groupId required" } };
+  const group = getGroup(groupId);
+  if (!group) return { status: 400, payload: { ok: false, error: "Group not found" } };
+  if (!inboundText) return { status: 400, payload: { ok: false, error: "inboundText required" } };
+
+  const thread = createTestThread({ accountId });
+  appendThreadMessage({ threadId: thread.id, direction: "in", text: inboundText });
+  const history = getThreadHistory(thread.id, 40);
+  const language = resolveThreadLanguage(thread, history) || "ru";
+
+  const renderedGroupPrompt = resolveGroupPrompt(group);
+  const { text: rawText, model } = await generateSalesReply({
+    salesScript: "",
+    dialogScenarios: "",
+    terminology: "",
+    taskType: "cold",
+    groupPrompt: renderedGroupPrompt,
+    firstMessageText: "",
+    history,
+    language,
+    locked: true,
+    defaultOnly: false,
+  });
+  const { findings } = lintReply({ reply: rawText, history, assembledPrompt: renderedGroupPrompt });
+  appendThreadMessage({ threadId: thread.id, direction: "out", text: rawText });
+  return {
+    status: 200,
+    payload: { ok: true, reply: rawText, model, language, findings, threadId: thread.id },
+  };
 }
 
 export const server = http.createServer(async (request, response) => {

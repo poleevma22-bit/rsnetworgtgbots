@@ -843,6 +843,44 @@ button[type="submit"]:hover {
   background: #e8eaed;
 }
 
+/* Drag-and-drop visual states. lead-chip uses cursor: grab when draggable;
+   switches to grabbing while dragging. drop-target highlights the cell the
+   chip is hovering over so the operator knows where it will land. */
+.lead-chip[draggable="true"] {
+  cursor: grab;
+}
+.lead-chip.dragging {
+  opacity: 0.45;
+  cursor: grabbing;
+}
+.crm-cell.drop-zone {
+  min-height: 38px;
+  border: 1px dashed transparent;
+  transition: background-color 80ms ease, border-color 80ms ease;
+}
+.crm-cell.drop-target {
+  background: rgba(99, 102, 241, 0.12);
+  border-color: rgba(99, 102, 241, 0.55);
+}
+
+/* Escalated lead chip. Visible across any stage column so the operator
+   can scan the matrix and immediately spot conversations the senior is on. */
+.lead-chip.escalated-chip {
+  border-color: #f97316;
+  box-shadow: 0 0 0 1px #f97316 inset, 0 0 8px rgba(249, 115, 22, 0.45);
+  background: #fff7ed;
+}
+.lead-chip.escalated-chip:hover {
+  background: #ffedd5;
+}
+.lead-chip .esc-badge {
+  display: inline-block;
+  margin-right: 2px;
+  font-size: 12px;
+  line-height: 1;
+  transform: translateY(-1px);
+}
+
 .modal {
   position: fixed;
   inset: 0;

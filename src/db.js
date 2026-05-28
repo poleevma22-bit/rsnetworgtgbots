@@ -256,6 +256,68 @@ catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw 
 try { db.exec(`ALTER TABLE account_groups ADD COLUMN escalation_username TEXT NOT NULL DEFAULT ''`); }
 catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
 
+// Backfill: account_groups gains an optional offer_link URL (Google Doc,
+// Notion, hosted PDF, Calendly, anything). When set, the AI is instructed
+// (via group_prompt and runtime injection) to share it with the client at
+// offer time instead of relying solely on the generated PDF flow.
+try { db.exec(`ALTER TABLE account_groups ADD COLUMN offer_link TEXT NOT NULL DEFAULT ''`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+
+// --- v3 prompt overhaul: split monolithic group_prompt into 5 structured
+// fields. group_prompt stays as a legacy fallback (see resolveGroupPrompt).
+// All ALTERs are idempotent via the duplicate-column trap, so this block is
+// safe to re-run on every boot.
+try { db.exec(`ALTER TABLE account_groups ADD COLUMN sales_persona TEXT NOT NULL DEFAULT ''`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+try { db.exec(`ALTER TABLE account_groups ADD COLUMN product_pitch TEXT NOT NULL DEFAULT ''`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+try { db.exec(`ALTER TABLE account_groups ADD COLUMN technical_prompt TEXT NOT NULL DEFAULT ''`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+try { db.exec(`ALTER TABLE account_groups ADD COLUMN qualification_questions TEXT NOT NULL DEFAULT ''`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+
+// --- v3 playground: test threads (is_test=1) flow through the same code
+// paths as real threads, then are filtered out of every read query below.
+try { db.exec(`ALTER TABLE conversation_threads ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0`); }
+catch (e) { if (!/duplicate column name/i.test(String(e?.message || ""))) throw e; }
+
+// --- v3 one-shot pre-migration backup: snapshot account_groups before the
+// new fields go live, so we can recover the original row state if a backfill
+// or composition change misbehaves. Gated on table existence so this runs
+// exactly once across all future boots.
+const __backupTableName = "account_groups_premigration_2026_05_25";
+const __backupExists = db.prepare(
+  "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name = ?"
+).get(__backupTableName);
+if (!__backupExists || __backupExists.n === 0) {
+  try {
+    db.exec(`CREATE TABLE ${__backupTableName} AS SELECT * FROM account_groups`);
+    console.log(`[db] one-shot backup created: ${__backupTableName}`);
+  } catch (e) {
+    console.warn(`[db] backup table creation failed: ${e?.message || e}`);
+  }
+}
+
+// --- v3 one-shot backfill: copy legacy group_prompt into sales_persona for
+// rows that have not yet adopted the new structured fields. Idempotent: once
+// sales_persona is non-empty, the WHERE clause excludes that row forever.
+try {
+  const result = db.prepare(`
+    UPDATE account_groups
+       SET sales_persona = group_prompt
+     WHERE TRIM(sales_persona) = ''
+       AND TRIM(product_pitch) = ''
+       AND TRIM(technical_prompt) = ''
+       AND TRIM(qualification_questions) = ''
+       AND TRIM(group_prompt) != ''
+  `).run();
+  if (result.changes > 0) {
+    console.log(`[db] v3 backfill: copied group_prompt → sales_persona for ${result.changes} group(s)`);
+  }
+} catch (e) {
+  console.warn(`[db] v3 backfill failed: ${e?.message || e}`);
+}
+
 // --- Migration: backfill v2 columns on existing broadcast_jobs rows. ALTER ADD COLUMN
 // is idempotent if we trap the "duplicate column" error, so this is safe to re-run.
 const __BROADCAST_V2_COLS = [
@@ -499,6 +561,94 @@ export function listBotApiAccounts() {
   return db.prepare("SELECT * FROM bots WHERE kind = 'bot_api' ORDER BY created_at ASC").all().map(rowToAccount);
 }
 
+// --- Health helpers ---
+//
+// Lightweight aggregate queries used by GET /api/health/snapshot. Bounded to
+// the last 24h to keep the dashboard cheap.
+
+export function countMessagesByDirection({ sinceMs, direction }) {
+  const row = db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM conversation_messages cm
+    JOIN conversation_threads ct ON ct.id = cm.thread_id
+    WHERE cm.sent_at >= ?
+      AND cm.direction = ?
+      AND ct.is_test = 0
+  `).get(Number(sinceMs) || 0, direction);
+  return row?.n || 0;
+}
+
+export function countMessagesContaining({ sinceMs, needle, direction }) {
+  // SQLite LIKE is case-insensitive for ASCII by default. We use a parameter
+  // for needle but wrap with %...% here. Caller must NOT include wildcards.
+  const dir = direction ? "AND cm.direction = ?" : "";
+  const sql = `
+    SELECT COUNT(*) AS n
+    FROM conversation_messages cm
+    JOIN conversation_threads ct ON ct.id = cm.thread_id
+    WHERE cm.sent_at >= ?
+      AND cm.text LIKE ?
+      AND ct.is_test = 0
+      ${dir}
+  `;
+  const params = [Number(sinceMs) || 0, `%${needle}%`];
+  if (direction) params.push(direction);
+  const row = db.prepare(sql).get(...params);
+  return row?.n || 0;
+}
+
+export function countOfferSentThreads({ sinceMs }) {
+  const row = db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM conversation_threads
+    WHERE offer_sent_at IS NOT NULL
+      AND offer_sent_at >= ?
+      AND is_test = 0
+  `).get(Number(sinceMs) || 0);
+  return row?.n || 0;
+}
+
+export function getMtprotoAccountsWithSessionAge() {
+  // session_age_days is approximated from the bot row's created_at. mtproto
+  // sessions don't carry an explicit creation timestamp, so this is the best
+  // signal we have without persisting per-session metadata.
+  const rows = db.prepare(`
+    SELECT id, username, kind, status, health, last_seen_at, created_at
+    FROM bots
+    WHERE kind = 'mtproto'
+    ORDER BY created_at ASC
+  `).all();
+  const nowMs = Date.now();
+  return rows.map((r) => {
+    const created = Date.parse(r.created_at) || nowMs;
+    return {
+      id: r.id,
+      username: r.username || "",
+      kind: r.kind,
+      status: r.status,
+      health: r.health,
+      last_seen_at: r.last_seen_at || null,
+      session_age_days: Math.floor((nowMs - created) / (24 * 60 * 60 * 1000)),
+    };
+  });
+}
+
+// --- Playground helpers ---
+
+let __playgroundCounter = 0;
+export function createTestThread({ accountId }) {
+  if (!accountId) throw new Error("accountId required");
+  __playgroundCounter += 1;
+  const now = Date.now();
+  const id = `th-test-${Math.random().toString(36).slice(2, 8)}-${now.toString(36)}-${__playgroundCounter}`;
+  db.prepare(`
+    INSERT INTO conversation_threads
+      (id, account_id, broadcast_id, target_username, target_telegram_id, state, is_test, created_at, updated_at)
+    VALUES (?, ?, NULL, '__playground__', NULL, 'active', 1, ?, ?)
+  `).run(id, accountId, now, now);
+  return getThread(id);
+}
+
 // --- Leads ---
 
 function rowToLead(row) {
@@ -517,15 +667,26 @@ function rowToLead(row) {
     // From JOIN with conversation_threads — used by CRM stage modal so the
     // operator can see / edit the client brand that drives PDF rendering.
     clientBrand: row.client_brand || "",
+    // Escalation state surfaced from the thread row. UI uses these to render
+    // the 🚨 badge on the chip so escalation is visible across any stage.
+    escalationCount: Number(row.escalation_count) || 0,
+    threadState: row.thread_state || "active",
     messages: safeParse(row.messages_json, [])
   };
 }
 
 export function listLeads() {
+  // Filter out leads whose thread is a playground test thread. The JOIN is
+  // LEFT so legacy leads with no matching thread (chat_id = numeric telegram
+  // id) still come through; we only exclude when the joined thread is a
+  // test row.
   return db.prepare(`
-    SELECT l.*, t.client_brand
+    SELECT l.*, t.client_brand,
+           t.escalation_count AS escalation_count,
+           t.state AS thread_state
     FROM leads l
     LEFT JOIN conversation_threads t ON t.id = l.chat_id
+    WHERE (t.is_test IS NULL OR t.is_test = 0)
     ORDER BY l.updated_at DESC
   `).all().map(rowToLead);
 }
@@ -534,39 +695,33 @@ export function findLeadByChat(accountId, chatId) {
   return rowToLead(db.prepare("SELECT * FROM leads WHERE account_id = ? AND chat_id = ?").get(accountId, String(chatId)));
 }
 
+// Legacy lead upsert from the mtproto inbound path. Used to be the only
+// path that created CRM lead rows, which duplicated the new thread-based
+// `syncLeadFromThread` rows and produced ghost stage-1 chips.
+//
+// Current behaviour:
+//   * If an existing lead row matches (account, chat_id), just refresh
+//     telegram_handle / last_reply_at / messages_json. No new row.
+//   * Otherwise: SKIP — `syncLeadFromThread` (driven by the conversation
+//     worker) is the authoritative path for new leads. It dedupes by
+//     thread id and applies isJunkLeadHandle + escalation-operator skip.
 export function upsertLead({ accountId, chatId, telegramUserId, telegramHandle, message, direction = "in" }) {
   const existing = findLeadByChat(accountId, chatId);
-  const messages = existing ? existing.messages : [];
+  if (!existing) return null; // do nothing — syncLeadFromThread will create it cleanly.
+  const messages = existing.messages || [];
   if (message) messages.push({ direction, text: message, at: nowIso() });
-  if (existing) {
-    db.prepare(`
-      UPDATE leads SET
-        telegram_user_id = COALESCE(@telegram_user_id, telegram_user_id),
-        telegram_handle = COALESCE(@telegram_handle, telegram_handle),
-        last_reply_at = CASE WHEN @direction = 'in' THEN @now ELSE last_reply_at END,
-        messages_json = @messages,
-        updated_at = @now
-      WHERE id = @id
-    `).run({
-      id: existing.id,
-      telegram_user_id: telegramUserId ? String(telegramUserId) : null,
-      telegram_handle: telegramHandle || null,
-      direction,
-      messages: JSON.stringify(messages.slice(-50)),
-      now: nowIso()
-    });
-    return findLeadByChat(accountId, chatId);
-  }
-  const id = `lead-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   db.prepare(`
-    INSERT INTO leads (id, account_id, telegram_user_id, telegram_handle, chat_id, stage_id, messages_json, last_reply_at)
-    VALUES (@id, @account_id, @telegram_user_id, @telegram_handle, @chat_id, 'stage-1', @messages, CASE WHEN @direction = 'in' THEN @now ELSE NULL END)
+    UPDATE leads SET
+      telegram_user_id = COALESCE(@telegram_user_id, telegram_user_id),
+      telegram_handle = COALESCE(@telegram_handle, telegram_handle),
+      last_reply_at = CASE WHEN @direction = 'in' THEN @now ELSE last_reply_at END,
+      messages_json = @messages,
+      updated_at = @now
+    WHERE id = @id
   `).run({
-    id,
-    account_id: accountId,
+    id: existing.id,
     telegram_user_id: telegramUserId ? String(telegramUserId) : null,
     telegram_handle: telegramHandle || null,
-    chat_id: String(chatId),
     direction,
     messages: JSON.stringify(messages.slice(-50)),
     now: nowIso()
@@ -651,9 +806,11 @@ export function findOrCreateThread({
   if (!accountId) throw new Error("accountId required");
   const usernameKey = String(targetUsername || "").toLowerCase().replace(/^@/, "");
   // Look up by (account_id, target_username) or (account_id, target_telegram_id).
+  // is_test = 0 keeps playground/test threads from being matched as real leads.
   const existing = db.prepare(`
     SELECT * FROM conversation_threads
     WHERE account_id = ?
+      AND is_test = 0
       AND (
         (? != '' AND target_username = ?) OR
         (? != '' AND target_telegram_id = ?)
@@ -685,11 +842,15 @@ export function getThread(id) {
 }
 
 export function listReadyThreads(now = Date.now(), limit = 50) {
+  // is_test = 0 excludes playground threads; the playground runs replies
+  // synchronously and never schedules ai_reply actions, but this is belt-
+  // and-suspenders in case a future code path queues one by mistake.
   return db.prepare(`
     SELECT * FROM conversation_threads
     WHERE next_action_at IS NOT NULL
       AND next_action_at <= ?
       AND state IN ('active', 'escalated')
+      AND is_test = 0
     ORDER BY next_action_at ASC
     LIMIT ?
   `).all(now, limit);
@@ -770,12 +931,30 @@ function genGroupId() {
   return `grp-${randomBytes(6).toString("hex")}`;
 }
 
-export function createGroup({ name, groupPrompt }) {
+export function createGroup({
+  name,
+  groupPrompt,
+  salesPersona,
+  productPitch,
+  technicalPrompt,
+  qualificationQuestions,
+} = {}) {
   const id = genGroupId();
   const now = Date.now();
   db.prepare(
-    "INSERT INTO account_groups (id, name, group_prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
-  ).run(id, String(name || "").trim() || "Безымянная группа", String(groupPrompt || ""), now, now);
+    `INSERT INTO account_groups
+       (id, name, group_prompt, sales_persona, product_pitch, technical_prompt, qualification_questions, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id,
+    String(name || "").trim() || "Безымянная группа",
+    String(groupPrompt || ""),
+    String(salesPersona || ""),
+    String(productPitch || ""),
+    String(technicalPrompt || ""),
+    String(qualificationQuestions || ""),
+    now, now
+  );
   return getGroup(id);
 }
 
@@ -799,6 +978,27 @@ export function updateGroup(id, fields) {
   if (fields.knowledgeBase !== undefined) { cols.push("knowledge_base = ?"); vals.push(String(fields.knowledgeBase || "")); }
   if (fields.offerMessage !== undefined) { cols.push("offer_message = ?"); vals.push(String(fields.offerMessage || "")); }
   if (fields.objections !== undefined) { cols.push("objections = ?"); vals.push(String(fields.objections || "")); }
+  if (fields.offerLink !== undefined) {
+    cols.push("offer_link = ?");
+    vals.push(String(fields.offerLink || "").trim());
+  }
+  // v3 structured prompt fields. Each maps 1:1 to its column.
+  if (fields.salesPersona !== undefined) {
+    cols.push("sales_persona = ?");
+    vals.push(String(fields.salesPersona || ""));
+  }
+  if (fields.productPitch !== undefined) {
+    cols.push("product_pitch = ?");
+    vals.push(String(fields.productPitch || ""));
+  }
+  if (fields.technicalPrompt !== undefined) {
+    cols.push("technical_prompt = ?");
+    vals.push(String(fields.technicalPrompt || ""));
+  }
+  if (fields.qualificationQuestions !== undefined) {
+    cols.push("qualification_questions = ?");
+    vals.push(String(fields.qualificationQuestions || ""));
+  }
   vals.push(id);
   db.prepare(`UPDATE account_groups SET ${cols.join(", ")} WHERE id = ?`).run(...vals);
   return getGroup(id);
@@ -1004,70 +1204,206 @@ export function bindGroupTemplate(groupId, { templateId, variables = {} } = {}) 
 }
 
 /**
- * Return the AI prompt text for a group, ready to feed into the model.
- *   1. Core: rendered template body (if template_id) or legacy group_prompt.
- *   2. Append knowledge_base as a "=== База знаний / терминология ===" section
- *      if non-empty. Goes in AFTER the core so it can override or extend.
- *   3. Append offer_message as a "=== Текст оффера ===" section if non-empty,
- *      with instructions to send verbatim when the client is ready and to
- *      append the [[OFFER_SENT]] marker.
- * Used by conversation.js when composing replies.
+ * Compose the system prompt the LLM receives for a group, by concatenating
+ * structured sections in a FIXED order with explicit `=== Title ===` headers.
+ *
+ * Section order:
+ *   1. === Кто ты ===                         (sales_persona)
+ *   2. === Что мы продаём ===                  (product_pitch)
+ *   3. === Как работает продукт технически === (technical_prompt) [NEW]
+ *   4. === Возражения и как их снимать ===     (objections)
+ *   5. === Обязательные вопросы для квалификации === (qualification_questions) [NEW]
+ *   6. === База знаний / терминология ===      (knowledge_base, legacy)
+ *   7. === Текст оффера ===                    (offer_message + [[OFFER_SENT]] guidance)
+ *   8. === Ссылка на оффер / презентацию ===   (offer_link)
+ *
+ * Empty (trim()) values are omitted entirely, header included. Legacy
+ * group_prompt is used as a fallback ONLY when ALL of the new structured
+ * fields are empty, in which case it renders under "=== Кто ты ===" so
+ * pre-v3 groups keep working without manual migration.
  */
+const __structuredFieldDefs = [
+  { key: "sales_persona",           header: "=== Кто ты ===" },
+  { key: "product_pitch",           header: "=== Что мы продаём ===" },
+  { key: "technical_prompt",        header: "=== Как работает продукт технически ===" },
+  { key: "objections",              header: "=== Возражения и как их снимать ===" },
+  { key: "qualification_questions", header: "=== Обязательные вопросы для квалификации ===" },
+];
+
+// Normalize a column value to a string. SQLite TEXT columns are usually
+// returned as JS strings by better-sqlite3, but rows inserted via the SQL
+// `readfile('path')` helper come back as Node Buffers (BLOB affinity). Cast
+// here so downstream string ops always work.
+function __asString(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  return String(value);
+}
+
+function __hasAnyStructuredField(group) {
+  return __structuredFieldDefs.some((def) => __asString(group?.[def.key]).trim() !== "");
+}
+
 export function resolveGroupPrompt(group) {
   if (!group) return "";
-  let core = "";
-  if (group.template_id) {
-    const tpl = getPromptTemplate(group.template_id);
-    if (tpl) {
-      const values = safeParse(group.template_vars_json, {});
-      core = renderTemplateBody(tpl.body, values, tpl.defaults);
+  const parts = [];
+  const hasStructured = __hasAnyStructuredField(group);
+
+  if (hasStructured) {
+    for (const def of __structuredFieldDefs) {
+      const value = __asString(group[def.key]);
+      if (value.trim() === "") continue;
+      parts.push(`${def.header}\n${value.trim()}`);
     }
+  } else if (__asString(group.group_prompt).trim() !== "") {
+    // Legacy fallback: render the monolithic prompt under the persona header
+    // so pre-v3 groups keep working until the founder migrates them.
+    parts.push(`=== Кто ты ===\n${__asString(group.group_prompt).trim()}`);
   }
-  if (!core) core = group.group_prompt || "";
-  const parts = [core];
-  if (group.knowledge_base && String(group.knowledge_base).trim()) {
-    parts.push(`\n=== База знаний / терминология ===\n${String(group.knowledge_base).trim()}`);
+
+  // knowledge_base is a free-form extension slot for terminology / glossaries.
+  // (Objections moved into the structured set above; the !hasStructured branch
+  // covers groups that haven't adopted structured fields yet.)
+  if (!hasStructured && __asString(group.objections).trim()) {
+    parts.push(`=== Возражения и как их снимать ===\n${__asString(group.objections).trim()}`);
   }
-  if (group.objections && String(group.objections).trim()) {
-    parts.push(`\n=== Возражения и кастомные ответы (применяй когда триггер совпадает) ===\n${String(group.objections).trim()}`);
+  if (__asString(group.knowledge_base).trim()) {
+    parts.push(`=== База знаний / терминология ===\n${__asString(group.knowledge_base).trim()}`);
   }
-  if (group.offer_message && String(group.offer_message).trim()) {
+
+  if (__asString(group.offer_message).trim()) {
     parts.push(
-      `\n=== Текст оффера (отправь дословно когда клиент готов получить оффер) ===\n${String(group.offer_message).trim()}\n\nКОГДА ТЫ ОТПРАВЛЯЕШЬ ОФФЕР: добавь в самом конце своего сообщения служебный маркер [[OFFER_SENT]] (без причины). Маркер автоматически вырежется из текста, который увидит клиент, а в CRM лид переедет в стадию «Оффер отправлен». Не отправляй оффер по своей инициативе — только когда клиент явно готов слушать (попросил оффер, цену, презентацию, детали продукта).`,
+      `=== Текст оффера ===\n${__asString(group.offer_message).trim()}\n\nКОГДА ТЫ ОТПРАВЛЯЕШЬ ОФФЕР: добавь в самом конце своего сообщения служебный маркер [[OFFER_SENT]] (без причины). Маркер автоматически вырежется из текста, который увидит клиент, а в CRM лид переедет в стадию «Оффер отправлен». Не отправляй оффер по своей инициативе, только когда клиент явно готов слушать (попросил оффер, цену, презентацию, детали продукта).`,
     );
   }
-  return parts.join("\n");
+  if (__asString(group.offer_link).trim()) {
+    parts.push(
+      `=== Ссылка на оффер / презентацию ===\nВ момент отправки оффера ОБЯЗАТЕЛЬНО вставь в текст следующую ссылку (на ней детали под клиента, цены, кейсы):\n${__asString(group.offer_link).trim()}\n\nФормат вставки естественный, например: "Вот детали оффера и кейсы: <ссылка>. Удобно созвониться обсудить?". Не прячь ссылку, всегда давай её на любой запрос "дай оффер", "дай детали", "сколько стоит".`,
+    );
+  }
+  return parts.join("\n\n");
+}
+
+/**
+ * Helper for the preview endpoint: same composition, but also returns a
+ * structured breakdown of which sections were emitted and their lengths.
+ */
+export function resolveGroupPromptWithBreakdown(group) {
+  const assembled = resolveGroupPrompt(group);
+  const sections = [];
+  // Re-derive the section list cheaply by scanning the assembled output
+  // for `=== ... ===` headers in document order.
+  const lines = assembled.split("\n");
+  let currentHeader = null;
+  let currentLength = 0;
+  for (const line of lines) {
+    if (/^=== .+ ===$/.test(line)) {
+      if (currentHeader) sections.push({ header: currentHeader, length: currentLength });
+      currentHeader = line;
+      currentLength = 0;
+    } else if (currentHeader) {
+      currentLength += line.length + 1;
+    }
+  }
+  if (currentHeader) sections.push({ header: currentHeader, length: currentLength });
+  return { assembled, sections };
 }
 
 // --- CRM lead-stage auto-classifier ---
 
+// Inbound text patterns that indicate the client is asking discovery / pricing
+// questions. Used to bump stage-1 → stage-2 even if it's the very first reply.
+const QUALIFICATION_INBOUND_RE = /(\?|сколько|почём|стоит|цен[аы]|что (вы|это)|как работает|расскажит|подробне|как именно|условия|what (do|is|are)|how (does|do you)|tell me more|details|pricing|cost)/i;
+
+// Substrings (case-insensitive) that indicate the conversation has moved past
+// small-talk into actual product discussion. Match on the full thread history.
+const PRESENTATION_KEYWORDS = [
+  "dsp", "meta", "youtube", "ремаркет", "remarket", "интеграц", "integration",
+  "s2s", "охват", "гео", "geo", "депозит", "deposit", "ftd", "ggr", "ретеншн",
+  "retention", "база игроков", "player database", "хеш", "hash", "nda",
+  "оффер", "offer", "презентац", "demo", "calendly",
+];
+
+// Inbound triggers that imply the client agreed to move forward / close.
+// Use carefully — these flip the lead to stage-5 (Выиграно), so prefer high-
+// confidence matches.
+const WON_INBOUND_RE = /(договорил|подписал|интегриру|запуска|поехали|давайте\s+(работать|стартовать)|let'?s\s+(go|start|do this)|signed|locked\s+in|onboard|kick\s*off|let'?s\s+roll)/i;
+
+function threadHistoryContainsKeyword(threadId, keywords) {
+  // Read last 30 messages, both directions. Cheap query; fine to call inside
+  // classifier since classifyThreadStage runs on lead syncs (not hot path).
+  try {
+    const rows = db.prepare(`
+      SELECT text FROM conversation_messages
+      WHERE thread_id = ?
+      ORDER BY sent_at DESC LIMIT 30
+    `).all(threadId);
+    const blob = rows.map((r) => String(r.text || "")).join(" ").toLowerCase();
+    return keywords.some((kw) => blob.includes(kw));
+  } catch { return false; }
+}
+
+function lastInboundTextOfThread(threadId) {
+  try {
+    const row = db.prepare(`
+      SELECT text FROM conversation_messages
+      WHERE thread_id = ? AND direction = 'in'
+      ORDER BY sent_at DESC LIMIT 1
+    `).get(threadId);
+    return row ? String(row.text || "") : "";
+  } catch { return ""; }
+}
+
 /**
- * Heuristic stage classification from a thread row. Pure function, no I/O.
+ * Stage classification combining counters, markers, and message-content
+ * keyword detection. Stage-4 (Согласование) and stage-onboarding are gone;
+ * stage-3 (Презентация) now absorbs anything between qualification and offer.
  *
- *   no inbound at all                   → stage-1  Новый контакт
- *   inbound ≥ 1, escalation_count = 0   → stage-2  Квалификация
- *   escalation_count ≥ 1, state escalat → stage-3  Презентация (бот заТРИГГЕРИЛ оффер/созвон, ждём старшего)
- *   escalation_count ≥ 1, state active  → stage-4  Согласование (старший уже отвечал, перешло живому CRM)
+ *   manual_stage_id set                   → respect operator override (incl. stage-hold/archive/5)
+ *   inbound text matches WON_INBOUND_RE   → stage-5  Выиграно
+ *   offer_sent_at                         → stage-offer
+ *   esc >= 1 OR keywords-of-product hit OR outbound_count >= 3  → stage-3 Презентация
+ *   inbound >= 1 (with question markers)  → stage-2  Квалификация
+ *   inbound >= 1 (anything)               → stage-2  Квалификация
+ *   else                                  → stage-1  Новый контакт
  *
- * Higher stages (stage-onboarding, stage-5 Выиграно, stage-hold, stage-archive)
- * require a deliberate operator flip via manual_stage_id; the auto-classifier
- * never moves leads there.
+ * Hold/archive transitions happen out-of-band via sweepStaleLeads().
  */
 export function classifyThreadStage(thread) {
   if (!thread) return "stage-1";
   if (thread.manual_stage_id) return thread.manual_stage_id;
   const inb = Number(thread.inbound_count) || 0;
+  const out = Number(thread.outbound_count) || 0;
   const esc = Number(thread.escalation_count) || 0;
   const offerSent = Boolean(thread.offer_sent_at);
 
-  // Highest auto-stage first: senior already handled a hot lead → stage-4.
-  if (esc >= 1 && thread.state !== "escalated") return "stage-4";
-  // Offer was sent (text) and senior hasn't taken over yet → stage-offer.
+  // High-confidence "won" signal from latest inbound, e.g. "договорились, поехали".
+  if (inb > 0) {
+    const lastIn = lastInboundTextOfThread(thread.id);
+    if (WON_INBOUND_RE.test(lastIn)) return "stage-5";
+  }
+
+  // Offer marker is a hard signal regardless of escalation state.
   if (offerSent) return "stage-offer";
-  // Escalated and still waiting on senior → stage-3 (Презентация).
+
+  // Presentation triggers: any escalation, OR enough outbounds to count as
+  // a pitch round, OR product keywords in the history.
   if (esc >= 1) return "stage-3";
-  // Client replied at least once but no offer/escalation yet → Квалификация.
-  if (inb >= 1) return "stage-2";
+  if (out >= 3) return "stage-3";
+  if (inb >= 1 && threadHistoryContainsKeyword(thread.id, PRESENTATION_KEYWORDS)) {
+    return "stage-3";
+  }
+
+  // Qualification: first inbound is enough; question-markers reinforce it
+  // (but we don't downgrade to stage-1 if no question — first reply still
+  // counts as engagement).
+  if (inb >= 1) {
+    const lastIn = lastInboundTextOfThread(thread.id);
+    if (QUALIFICATION_INBOUND_RE.test(lastIn)) return "stage-2";
+    return "stage-2";
+  }
+
   return "stage-1";
 }
 
@@ -1086,26 +1422,68 @@ export function markThreadOfferSent(threadId) {
  * Junk-bot inbounds (anonsayrobot, ruletkaa_chat_bot, etc.) are skipped so
  * the CRM doesn't fill up with template-spam Telegram bots.
  */
+// Junk-bot handles + display-name fingerprints. Anything matched here is
+// kept OUT of the CRM (skipped on insert; deleted on next sync).
+//
+// Two classes of matches:
+//   1. Telegram @usernames that obviously belong to template/forwarder bots
+//      (all bot usernames must end with "bot" per Telegram rules).
+//   2. First-name fallbacks (when sender has no @username, the mtproto
+//      handler stores their first_name). Common patterns: emoji-laden
+//      service bots ("Анонимные послания 💌"), notification senders.
 const JUNK_LEAD_PATTERNS = [
+  // Username class
   /bot$/i, /^anonsay/i, /^anonkar/i, /^anonxzx/i, /^ruletkaa?/i,
-  /^talkme/i, /^tikible/i, /^ttsave/i,
+  /^talkme/i, /^tikible/i, /^ttsave/i, /^kupidosha/i, /^twinglo/i,
+  // First-name / display-name class (sender has no @username)
+  /аноним/i, /послани/i, /чат[\s-]*бот/i, /💌|🎲|💋|🎁/u,
+  /sayrobot|chatrobot|gamebot|adultbot/i,
 ];
 function isJunkLeadHandle(handle) {
   if (!handle) return true;
-  const h = String(handle).toLowerCase().replace(/^@/, "");
+  const cleaned = String(handle).trim();
+  if (!cleaned) return true;
+  const stripped = cleaned.replace(/^@/, "");
+  // Telegram usernames are strictly [A-Za-z0-9_] (5-32 chars, but we don't
+  // enforce length here). Anything outside that charset is a first-name /
+  // display-name fallback from a sender without a username — almost always
+  // a service bot or anonymous-message forwarder.
+  if (!/^[A-Za-z0-9_]+$/.test(stripped)) return true;
+  const h = stripped.toLowerCase();
   return JUNK_LEAD_PATTERNS.some((re) => re.test(h));
 }
+
+// Hook for funnel-progression notifications. conversation.js installs a
+// callback that knows how to DM the escalation_username from the bot account.
+// Stage transitions to "interesting" stages (offer/onboarding/won) trigger
+// it so the senior manager gets passive heads-ups on every meaningful move.
+let pipelineNotifyHook = null;
+export function setPipelineNotifyHook(fn) { pipelineNotifyHook = typeof fn === "function" ? fn : null; }
+const PIPELINE_NOTIFY_STAGES = new Set(["stage-offer", "stage-5"]);
 
 export function syncLeadFromThread(threadId) {
   const thread = getThread(threadId);
   if (!thread) return null;
-  if (isJunkLeadHandle(thread.target_username)) return null;
+  // Playground / test threads never participate in CRM. Drop any stray
+  // lead row that might have been created before this guard existed.
+  if (thread.is_test === 1) {
+    try { db.prepare("DELETE FROM leads WHERE chat_id = ?").run(thread.id); } catch {}
+    return null;
+  }
+  // Junk-bot handles (anonsayrobot, ruletkaa_chat_bot, anything ending in
+  // "bot") should never be CRM leads. If a row was created before this
+  // filter existed, delete it now so the matrix isn't polluted.
+  if (isJunkLeadHandle(thread.target_username)) {
+    try { db.prepare("DELETE FROM leads WHERE chat_id = ?").run(thread.id); } catch {}
+    return null;
+  }
   // Skip threads that exist only because of senior-operator forwards (the
   // operator is not a CRM lead). The operator's username is on the group's
   // escalation_username field.
   const group = findGroupForAccount(thread.account_id);
   if (group?.escalation_username &&
       String(thread.target_username).toLowerCase() === String(group.escalation_username).toLowerCase()) {
+    try { db.prepare("DELETE FROM leads WHERE chat_id = ?").run(thread.id); } catch {}
     return null;
   }
 
@@ -1116,15 +1494,18 @@ export function syncLeadFromThread(threadId) {
     direction: m.direction, text: m.text, at: m.sent_at,
   })));
 
+  // Capture previous stage BEFORE we update — used to detect transitions
+  // that should ping the senior manager (passive progress notification).
+  const previousStageRow = db.prepare("SELECT stage_id FROM leads WHERE chat_id = ?").get(thread.id);
+  const previousStage = previousStageRow?.stage_id || null;
+
   // chat_id = thread.id keeps mapping 1:1. status = current stage label
   // (for quick-glance tooltips in the CRM lead chip).
   const STAGE_LABEL = {
     "stage-1": "Новый контакт",
     "stage-2": "Квалификация",
-    "stage-3": "Презентация (оффер/созвон триггер)",
+    "stage-3": "Презентация",
     "stage-offer": "Оффер отправлен",
-    "stage-4": "Согласование (передан старшему)",
-    "stage-onboarding": "Онбординг",
     "stage-5": "Выиграно",
     "stage-hold": "Hold",
     "stage-archive": "Archive",
@@ -1155,6 +1536,7 @@ export function syncLeadFromThread(threadId) {
       language: thread.language || null,
       last_in: thread.last_inbound_at || 0,
     });
+    maybeFirePipelineNotify({ thread, previousStage, stageId });
     return existing.id;
   }
 
@@ -1177,7 +1559,80 @@ export function syncLeadFromThread(threadId) {
     language: thread.language || null,
     last_in: thread.last_inbound_at || 0,
   });
+  maybeFirePipelineNotify({ thread, previousStage, stageId });
   return id;
+}
+
+// Scans active threads and auto-flips stale ones to stage-hold / stage-archive
+// based on time since last inbound. Conservative: skips threads that have an
+// operator override (manual_stage_id), are already at the target stage, or are
+// in terminal stages (stage-5 Выиграно). Called by the conversation worker on
+// an hourly tick.
+//
+// Thresholds (per founder spec, 2026-05-24):
+//   no inbound > 7  days → stage-hold
+//   no inbound > 30 days → stage-archive (overrides hold)
+export function sweepStaleLeads({ now = Date.now() } = {}) {
+  const HOLD_MS    = 7  * 24 * 60 * 60 * 1000;
+  const ARCHIVE_MS = 30 * 24 * 60 * 60 * 1000;
+  let moved = { hold: 0, archive: 0 };
+
+  // Use last_inbound_at if set; otherwise fall back to created_at so leads
+  // that never responded still flow into hold/archive over time.
+  const rows = db.prepare(`
+    SELECT id, account_id, target_username, manual_stage_id,
+           COALESCE(last_inbound_at, created_at) AS effective_last_at
+    FROM conversation_threads
+    WHERE state != 'completed'
+      AND is_test = 0
+  `).all();
+
+  for (const row of rows) {
+    if (row.manual_stage_id) continue; // operator override wins
+    if (isJunkLeadHandle(row.target_username)) continue;
+    const age = now - Number(row.effective_last_at || now);
+    let nextStage = null;
+    if (age > ARCHIVE_MS) nextStage = "stage-archive";
+    else if (age > HOLD_MS) nextStage = "stage-hold";
+    if (!nextStage) continue;
+    // Don't flip leads already at or past the target stage.
+    const lead = db.prepare("SELECT stage_id FROM leads WHERE chat_id = ?").get(row.id);
+    if (!lead) continue;
+    if (lead.stage_id === nextStage) continue;
+    if (lead.stage_id === "stage-5") continue;
+    // For hold, also skip leads already archived (archive > hold).
+    if (nextStage === "stage-hold" && lead.stage_id === "stage-archive") continue;
+    db.prepare("UPDATE conversation_threads SET manual_stage_id = ?, updated_at = ? WHERE id = ?")
+      .run(nextStage, now, row.id);
+    try { syncLeadFromThread(row.id); } catch (err) {
+      console.error(`[sweep] syncLead(${row.id}) failed:`, err?.message || err);
+    }
+    if (nextStage === "stage-hold") moved.hold += 1;
+    if (nextStage === "stage-archive") moved.archive += 1;
+  }
+  if (moved.hold || moved.archive) {
+    console.log(`[sweep] stale-leads moved: hold=${moved.hold} archive=${moved.archive}`);
+  }
+  return moved;
+}
+
+// Decoupled helper: fires the hook only when the stage actually changed AND
+// landed on one of the interesting stages. Wrapped in try/catch so DB writes
+// never fail because of a downstream DM hiccup.
+function maybeFirePipelineNotify({ thread, previousStage, stageId }) {
+  if (!pipelineNotifyHook) return;
+  if (previousStage === stageId) return;
+  if (!PIPELINE_NOTIFY_STAGES.has(stageId)) return;
+  try {
+    pipelineNotifyHook({
+      threadId: thread.id,
+      accountId: thread.account_id,
+      previousStage,
+      stageId,
+    });
+  } catch (err) {
+    console.error(`[db] pipelineNotifyHook(${thread.id}) failed:`, err?.message || err);
+  }
 }
 
 /**
